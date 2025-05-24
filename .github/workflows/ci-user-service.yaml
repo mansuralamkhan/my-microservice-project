@@ -55,7 +55,41 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-maven-
 
+      - name: Validate project
+        run: |
+          cd ${{ matrix.service }}
+          mvn validate
+      - name: Compile project
+        run: |
+          cd ${{ matrix.service }}
+          mvn compile
+      - name: Package project
+        run: |
+          cd ${{ matrix.service }}
+          mvn package -DskipTests=true
       - name: Run Unit Tests
         run: |
           cd ${{ matrix.service }}
-          mvn test
+          mvn test -DskipITs=true
+      - name: Run Integration Tests
+        run: |
+          cd ${{ matrix.service }}
+          mvn verify -DskipTests=true
+      - name: Run Spotless Check
+        run: |
+          cd ${{ matrix.service }}
+          mvn spotless:check
+      - name: Run Spotless Apply
+        run: |
+          cd ${{ matrix.service }}
+          mvn spotless:apply
+      - name: Run Jacoco Report
+        run: |
+          cd ${{ matrix.service }}
+          mvn jacoco:report
+      - name: Upload Jacoco Report  
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report-${{ matrix.service }}     
+      
+      
