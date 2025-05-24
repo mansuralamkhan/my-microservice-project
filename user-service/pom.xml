@@ -9,9 +9,29 @@
     <!-- your dependencies here -->
   </dependencies>
 
-  <build>
-    <plugins>
-      <!-- plugins here -->
-    </plugins>
-  </build>
+<build>
+  <plugins>
+    <plugin>
+      <groupId>com.diffplug.spotless</groupId>
+      <artifactId>spotless-maven-plugin</artifactId>
+      <version>2.37.0</version> <!-- You can use latest -->
+      <executions>
+        <execution>
+          <goals>
+            <goal>check</goal>
+            <goal>apply</goal> <!-- Optional: format automatically -->
+          </goals>
+        </execution>
+      </executions>
+      <configuration>
+        <java>
+          <eclipse>
+            <file>google-java-format</file> <!-- You can use 'eclipse' instead -->
+          </eclipse>
+        </java>
+      </configuration>
+    </plugin>
+  </plugins>
+</build>
+
 </project>
