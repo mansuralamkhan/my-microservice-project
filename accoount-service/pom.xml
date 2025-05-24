@@ -1,0 +1,17 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>user-service</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <dependencies>
+    <!-- your dependencies here -->
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- plugins here -->
+    </plugins>
+  </build>
+</project>
