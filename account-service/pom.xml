@@ -9,7 +9,7 @@
     <!-- your dependencies here -->
   </dependencies>
 
- <build>
+<build>
   <plugins>
     <plugin>
       <groupId>com.diffplug.spotless</groupId>
@@ -24,8 +24,8 @@
         </execution>
       </executions>
       <configuration>
-      
-          <java>
+        
+         <java>
   <googleJavaFormat/>
 </java>
 
@@ -33,6 +33,31 @@
       </configuration>
     </plugin>
   </plugins>
+ 
+  <plugins>
+    <plugin>
+      <groupId>org.jacoco</groupId>
+      <artifactId>jacoco-maven-plugin</artifactId>
+      <version>0.8.10</version> <!-- Use latest stable version -->
+      <executions>
+        <execution>
+          <goals>
+            <goal>prepare-agent</goal>
+          </goals>
+        </execution>
+        <execution>
+          <id>report</id>
+          <phase>verify</phase>
+          <goals>
+            <goal>report</goal>
+          </goals>
+        </execution>
+      </executions>
+    </plugin>
+  </plugins>
+
+
 </build>
+
 
 </project>
