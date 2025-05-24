@@ -24,11 +24,12 @@
         </execution>
       </executions>
       <configuration>
-        <java>
-          <eclipse>
-            <file>google-java-format</file> <!-- You can use 'eclipse' instead -->
-          </eclipse>
-        </java>
+        
+         <java>
+  <googleJavaFormat/>
+</java>
+
+        
       </configuration>
     </plugin>
   </plugins>
