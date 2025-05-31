@@ -90,6 +90,7 @@ jobs:
       - name: Upload Jacoco Report  
         uses: actions/upload-artifact@v4
         with:
-          name: jacoco-report-${{ matrix.service }}     
+          name: jacoco-report-${{ matrix.service }}
+          path: target/site/jacoco/    
       
       
