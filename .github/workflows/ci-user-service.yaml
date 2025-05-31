@@ -106,6 +106,6 @@ jobs:
           path: |
             target/site/jacoco/jacoco.xml
             target/site/jacoco/index.html
-            index.html 
+            ${{ matrix.service}}-index.html 
       
       
