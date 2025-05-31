@@ -86,11 +86,26 @@ jobs:
       - name: Run Jacoco Report
         run: |
           cd ${{ matrix.service }}
-          mvn jacoco:report
-      - name: Upload Jacoco Report  
+          mvn jacoco:report  
+      - name: Create Hello World HTML
+        run: |
+          echo '<!DOCTYPE html>
+          <html>
+          <head>
+            <title>Hello World</title>
+          </head>
+          <body>
+            <h1>Hello, World!</h1>
+          </body>
+          </html>' > index.html
+      - name: Upload coverage and hello world files
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jacoco-report-${{ matrix.service }}
-          path: target/site/jacoco/    
+          name: coverage-report
+          path: |
+            target/site/jacoco/jacoco.xml
+            target/site/jacoco/index.html
+            index.html 
       
       
