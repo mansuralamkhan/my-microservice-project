@@ -1,112 +1,1096 @@
-name: Microservices CI Pipeline
+name: Enterprise Microservices CI/CD Pipeline
 
 on:
+  # Multi-trigger strategy for different workflows
   push:
-    branches: [main]
+    branches:
+      - 'feature/**'           # Development environments
+      - 'develop'              # Staging environment
+      - 'main'                 # Production candidate
+      - 'release/**'           # Release branches
+      - 'hotfix/**'            # Emergency fixes
+    tags:
+      - 'v*.*.*'               # Versioned releases
+      - 'v*.*.*-*'             # Pre-releases
   pull_request:
-    branches: [main]
+    branches: [develop, main, release/**]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:           # Manual triggers
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - deploy
+          - rollback
+          - promote
+          - emergency-patch
+      environment:
+        description: 'Target environment'
+        required: false
+        type: choice
+        options:
+          - development
+          - staging
+          - canary
+          - production
+      version:
+        description: 'Version/tag to deploy'
+        required: false
+        type: string
+  schedule:
+    # Daily security scans
+    - cron: '0 2 * * *'
 
+# Concurrency with environment awareness
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.environment || 'default' }}
+  cancel-in-progress: ${{ github.event_name != 'pull_request' }}
+
+# Global environment variables
+env:
+  # Build configuration
+  JAVA_VERSION: '17'
+  JAVA_DISTRIBUTION: 'temurin'
+  MAVEN_OPTS: '-Dmaven.repo.local=$HOME/.m2/repository'
+  
+  # Dynamic environment determination
+  DEPLOY_ENVIRONMENT: ${{ 
+    github.event_name == 'workflow_dispatch' && github.event.inputs.environment ||
+    github.event_name == 'release' && 'production' ||
+    contains(github.ref, 'refs/tags/v') && 'production' ||
+    github.ref == 'refs/heads/main' && 'production-candidate' ||
+    github.ref == 'refs/heads/develop' && 'staging' ||
+    contains(github.ref, 'refs/heads/feature/') && 'development' ||
+    contains(github.ref, 'refs/heads/release/') && 'pre-production' ||
+    contains(github.ref, 'refs/heads/hotfix/') && 'emergency-production' ||
+    'unknown'
+  }}
+  
+  # Security scanning thresholds
+  TRIVY_SEVERITY: 'CRITICAL,HIGH'
+  DEPENDENCY_CHECK_FAIL_THRESHOLD: 'high'
+  SONARQUBE_QUALITY_GATE: 'SonarSource Way'
+
+# Organization defaults
+defaults:
+  run:
+    shell: bash
+
+# -------------------------------------------------------------------
+# JOBS: PHASE 1 - VALIDATION & QUALITY GATES
+# -------------------------------------------------------------------
 
 jobs:
-  lint:
+  # Job 1: Environment & Pipeline Validation
+  validate-pipeline:
+    name: Validate Pipeline
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        service: [user-service, account-service]
+    outputs:
+      deploy-environment: ${{ steps.env.outputs.deploy-environment }}
+      deployment-strategy: ${{ steps.strategy.outputs.deployment-strategy }}
+      deployment-window: ${{ steps.window.outputs.within-window }}
+      service-matrix: ${{ steps.services.outputs.service-matrix }}
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Lint Check (Spotless)
+      - name: Determine deployment environment
+        id: env
         run: |
-          cd ${{ matrix.service }}
-          mvn spotless:check
+          ENV="${{ env.DEPLOY_ENVIRONMENT }}"
+          echo "deploy-environment=$ENV" >> $GITHUB_OUTPUT
+          
+          # Validate environment
+          if [ "$ENV" = "unknown" ]; then
+            echo "❌ Cannot determine deployment environment"
+            exit 1
+          fi
 
-  test:
+      - name: Check deployment window
+        id: window
+        run: |
+          if [ "${{ env.DEPLOY_ENVIRONMENT }}" = "production" ]; then
+            # Only allow deployments during business hours
+            HOUR=$(date -u +%H)
+            DAY=$(date -u +%u)  # 1=Monday, 7=Sunday
+            
+            if [ $DAY -gt 5 ] || [ $HOUR -lt 9 ] || [ $HOUR -gt 17 ]; then
+              echo "⏰ Outside production deployment window (Mon-Fri 9AM-5PM UTC)"
+              echo "within-window=false" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          fi
+          echo "within-window=true" >> $GITHUB_OUTPUT
+
+      - name: Determine deployment strategy
+        id: strategy
+        run: |
+          ENV="${{ env.DEPLOY_ENVIRONMENT }}"
+          
+          case $ENV in
+            development)
+              echo "deployment-strategy=recreate" >> $GITHUB_OUTPUT
+              ;;
+            staging)
+              echo "deployment-strategy=rolling" >> $GITHUB_OUTPUT
+              ;;
+            canary|production)
+              echo "deployment-strategy=blue-green" >> $GITHUB_OUTPUT
+              ;;
+            emergency-production)
+              echo "deployment-strategy=emergency-rolling" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "deployment-strategy=rolling" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Load service dependencies
+        id: services
+        run: |
+          # Read service dependencies from configuration
+          if [ -f ".github/service-dependencies.yaml" ]; then
+            SERVICES=$(yq e '.services[]' .github/service-dependencies.yaml | jq -R -s -c 'split("\n") | map(select(. != ""))')
+            echo "service-matrix=$SERVICES" >> $GITHUB_OUTPUT
+          else
+            # Default services
+            echo 'service-matrix=["account-service","transaction-service","user-service"]' >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate external dependencies
+        run: |
+          ./scripts/validate-dependencies.sh
+
+  # Job 2: Code Quality & Security Scanning
+  code-quality:
+    name: Code Quality Gates
     runs-on: ubuntu-latest
-    needs: lint
+    needs: validate-pipeline
     strategy:
       matrix:
-        service: [user-service, account-service]
+        service: ${{ fromJson(needs.validate-pipeline.outputs.service-matrix) }}
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up JDK 17
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
 
-      - name: Cache Maven Dependencies
+      - name: Cache Maven dependencies
         uses: actions/cache@v4
         with:
-          path: ~/.m2
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}-${{ hashFiles('**/pom.xml', '!**/target/**') }}
           restore-keys: |
+            ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
             ${{ runner.os }}-maven-
 
-      - name: Validate project
-        run: |
-          cd ${{ matrix.service }}
-          mvn validate
-      - name: Compile project
-        run: |
-          cd ${{ matrix.service }}
-          mvn compile
-      - name: Package project
-        run: |
-          cd ${{ matrix.service }}
-          mvn package -DskipTests=true
-      - name: Run Unit Tests
-        run: |
-          cd ${{ matrix.service }}
-          mvn test -DskipITs=true
-      - name: Run Integration Tests
-        run: |
-          cd ${{ matrix.service }}
-          mvn verify -DskipTests=true
-      - name: Run Spotless Check
-        run: |
-          cd ${{ matrix.service }}
-          mvn spotless:check
-      - name: Run Spotless Apply
-        run: |
-          cd ${{ matrix.service }}
-          mvn spotless:apply
-      - name: Run Jacoco Report
-        run: |
-          cd ${{ matrix.service }}
-          mvn jacoco:report  
-      - name: Create Hello World HTML
-        run: |
-          echo '<!DOCTYPE html>
-          <html>
-          <head>
-            <title>Hello World</title>
-          </head>
-          <body>
-            <h1>Hello, World!</h1>
-          </body>
-          </html>' > index.html
-      - name: Upload coverage and hello world files
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Run static code analysis
+        working-directory: ${{ matrix.service }}
+        run: mvn spotless:check pmd:check checkstyle:check
+
+      - name: Run unit tests with coverage
+        working-directory: ${{ matrix.service }}
+        run: mvn test -Djacoco.skip=false
+
+      - name: Upload test coverage
+        uses: codecov/codecov-action@v3
         with:
-          name: coverage-report
-          path: |
-            target/site/jacoco/jacoco.xml
-            target/site/jacoco/index.html
-            index.html
-            cp index.html index2.html 
+          directory: ${{ matrix.service }}/target/site/jacoco/
+          flags: unittests
+
+      - name: Run OWASP dependency check
+        working-directory: ${{ matrix.service }}
+        run: |
+          mvn org.owasp:dependency-check-maven:check \
+            -DfailBuildOnCVSS=${{ env.DEPENDENCY_CHECK_FAIL_THRESHOLD }} \
+            -DsuppressionFile=.dependency-check-suppressions.xml
+
+      - name: Run SAST scanning
+        uses: shiftleftsecurity/scan-action@master
+        env:
+          WORKSPACE: ${{ matrix.service }}
+        with:
+          output: reports
+          type: java
+
+  # Job 3: SonarQube Analysis
+  sonarqube-analysis:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    needs: [validate-pipeline, code-quality]
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.validate-pipeline.outputs.service-matrix) }}
+    environment: ${{ needs.validate-pipeline.outputs.deploy-environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+
+      - name: Cache SonarQube packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-sonar-
+
+      - name: Run SonarQube analysis
+        working-directory: ${{ matrix.service }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        run: |
+          mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+            -Dsonar.projectKey=${{ matrix.service }} \
+            -Dsonar.projectName="${{ matrix.service }} - ${{ github.ref_name }}" \
+            -Dsonar.branch.name=${{ github.ref_name }} \
+            -Dsonar.qualitygate.wait=true
+
+      - name: Check Quality Gate
+        uses: sonarsource/sonarqube-quality-gate-action@v1.1.0
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # Job 4: Build & Security Scan Containers
+  build-and-scan:
+    name: Build & Security Scan
+    runs-on: ubuntu-latest
+    needs: [validate-pipeline, sonarqube-analysis]
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.validate-pipeline.outputs.service-matrix) }}
+    environment: ${{ needs.validate-pipeline.outputs.deploy-environment }}
+    outputs:
+      image-tag: ${{ steps.tag.outputs.image-tag }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: Generate version tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" =~ refs/tags/v.* ]]; then
+            # Use semantic version from tag
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            echo "image-tag=$VERSION" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+            # Use provided version
+            echo "image-tag=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            # Generate version: env-commit-date-build
+            DATE=$(date +'%Y%m%d-%H%M')
+            echo "image-tag=${{ needs.validate-pipeline.outputs.deploy-environment }}-${{ github.sha:0:8 }}-$DATE-${{ github.run_number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:master
+            network=host
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.CONTAINER_REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build container image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service }}
+          push: false  # Don't push until security scans pass
+          tags: |
+            ${{ vars.CONTAINER_REGISTRY }}/${{ matrix.service }}:${{ steps.tag.outputs.image-tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.created=${{ steps.timestamp.outputs.time }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.image-tag }}
+            com.example.environment=${{ needs.validate-pipeline.outputs.deploy-environment }}
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ vars.CONTAINER_REGISTRY }}/${{ matrix.service }}:${{ steps.tag.outputs.image-tag }}'
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.service }}.sarif'
+          severity: '${{ env.TRIVY_SEVERITY }}'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results-${{ matrix.service }}.sarif'
+
+      - name: Run container image signing
+        if: success()
+        uses: sigstore/cosign-installer@v3.1.1
+        with:
+          cosign-release: 'v2.1.1'
+
+      - name: Sign the container image
+        if: success()
+        env:
+          COSIGN_EXPERIMENTAL: 'true'
+        run: |
+          cosign sign \
+            --key env://COSIGN_PRIVATE_KEY \
+            ${{ vars.CONTAINER_REGISTRY }}/${{ matrix.service }}:${{ steps.tag.outputs.image-tag }}
+
+      - name: Generate SBOM
+        if: success()
+        run: |
+          trivy image --format cyclonedx \
+            ${{ vars.CONTAINER_REGISTRY }}/${{ matrix.service }}:${{ steps.tag.outputs.image-tag }} \
+            -o sbom-${{ matrix.service }}.json
+
+          # Attest SBOM
+          cosign attest \
+            --predicate sbom-${{ matrix.service }}.json \
+            --type cyclonedx \
+            ${{ vars.CONTAINER_REGISTRY }}/${{ matrix.service }}:${{ steps.tag.outputs.image-tag }}
+
+  # Job 5: Push Secure Images
+  push-secure-images:
+    name: Push Secure Images
+    runs-on: ubuntu-latest
+    needs: [validate-pipeline, build-and-scan]
+    if: |
+      needs.validate-pipeline.outputs.deploy-environment != 'unknown' &&
+      needs.build-and-scan.result == 'success'
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.validate-pipeline.outputs.service-matrix) }}
+    environment: ${{ needs.validate-pipeline.outputs.deploy-environment }}
+    steps:
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.CONTAINER_REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Push signed container image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ vars.CONTAINER_REGISTRY }}/${{ matrix.service }}:${{ needs.build-and-scan.outputs.image-tag }}
+          labels: ${{ needs.build-and-scan.outputs.labels }}
+
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            --key env://COSIGN_PUBLIC_KEY \
+            ${{ vars.CONTAINER_REGISTRY }}/${{ matrix.service }}:${{ needs.build-and-scan.outputs.image-tag }}
+
+      - name: Record image in deployment registry
+        run: |
+          curl -X POST ${{ vars.DEPLOYMENT_REGISTRY_URL }}/api/deployments \
+            -H "Authorization: Bearer ${{ secrets.DEPLOYMENT_REGISTRY_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "service": "${{ matrix.service }}",
+              "environment": "${{ needs.validate-pipeline.outputs.deploy-environment }}",
+              "image": "${{ vars.CONTAINER_REGISTRY }}/${{ matrix.service }}:${{ needs.build-and-scan.outputs.image-tag }}",
+              "digest": "${{ needs.build-and-scan.outputs.image-digest }}",
+              "commit_sha": "${{ github.sha }}",
+              "deployed_by": "${{ github.actor }}",
+              "timestamp": "${{ steps.timestamp.outputs.time }}"
+            }'
+
+# -------------------------------------------------------------------
+# PHASE 2: DEPLOYMENT ORCHESTRATION
+# -------------------------------------------------------------------
+
+  # Job 6: Update GitOps Repository
+  update-gitops-repository:
+    name: Update GitOps Repository
+    runs-on: ubuntu-latest
+    needs: [validate-pipeline, push-secure-images]
+    if: |
+      contains(fromJson('["staging", "canary", "production", "pre-production", "emergency-production"]'), 
+               needs.validate-pipeline.outputs.deploy-environment)
+    environment: ${{ needs.validate-pipeline.outputs.deploy-environment }}
+    steps:
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops-repo
+
+      - name: Acquire distributed lock
+        uses: clearance/actions-lock@v1
+        with:
+          key: gitops-${{ needs.validate-pipeline.outputs.deploy-environment }}
+          wait: true
+          wait-timeout: 300
+
+      - name: Update all service manifests atomically
+        run: |
+          cd gitops-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Create update branch
+          git checkout -b update-${{ github.run_id }}
+          
+          # Update all services in single commit
+          for service in ${{ join(fromJson(needs.validate-pipeline.outputs.service-matrix), ' ') }}; do
+            yq eval -i "
+              .spec.template.spec.containers[0].image = \"${{ vars.CONTAINER_REGISTRY }}/$service:${{ needs.build-and-scan.outputs.image-tag }}\" |
+              .metadata.annotations.\"deploy.timestamp\" = \"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\" |
+              .metadata.annotations.\"deploy.commit\" = \"${{ github.sha }}\" |
+              .metadata.annotations.\"deploy.actor\" = \"${{ github.actor }}\"
+            " environments/${{ needs.validate-pipeline.outputs.deploy-environment }}/$service/deployment.yaml
+          done
+
+      - name: Create Pull Request
+        id: create-pr
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops-repo
+          commit-message: "Deploy ${{ needs.build-and-scan.outputs.image-tag }} to ${{ needs.validate-pipeline.outputs.deploy-environment }}"
+          title: "Deploy ${{ needs.build-and-scan.outputs.image-tag }} to ${{ needs.validate-pipeline.outputs.deploy-environment }}"
+          body: |
+            ## Automated Deployment
+            
+            **Services Updated:**
+            ${{ join(fromJson(needs.validate-pipeline.outputs.service-matrix), '\n') }}
+            
+            **Version:** ${{ needs.build-and-scan.outputs.image-tag }}
+            **Commit:** ${{ github.sha }}
+            **Deployed by:** ${{ github.actor }}
+            
+            ## Changes
+            Updates container images to ${{ needs.build-and-scan.outputs.image-tag }}
+            
+            ## Quality Gates Passed
+            - ✅ Code Quality
+            - ✅ Security Scanning  
+            - ✅ Dependency Checks
+            - ✅ SonarQube Quality Gate
+          branch: update-${{ github.run_id }}
+          base: ${{ needs.validate-pipeline.outputs.deploy-environment }}
+
+      - name: Auto-merge PR (non-production)
+        if: |
+          needs.validate-pipeline.outputs.deploy-environment != 'production' &&
+          needs.validate-pipeline.outputs.deploy-environment != 'emergency-production'
+        run: |
+          gh pr merge ${{ steps.create-pr.outputs.pull-request-number }} \
+            --auto \
+            --merge \
+            --subject "Auto-merge: Deploy to ${{ needs.validate-pipeline.outputs.deploy-environment }}"
+
+      - name: Release distributed lock
+        if: always()
+        uses: clearance/actions-lock@v1
+        with:
+          key: gitops-${{ needs.validate-pipeline.outputs.deploy-environment }}
+          release: true
+
+  # Job 7: Manual Approval Gate (Production Only)
+  production-approval:
+    name: Production Approval
+    if: |
+      needs.validate-pipeline.outputs.deploy-environment == 'production' &&
+      github.event_name != 'workflow_dispatch'
+    needs: [validate-pipeline, update-gitops-repository]
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      approved: ${{ steps.approval.outputs.approved }}
+    steps:
+      - name: Request production approval
+        id: approval
+        uses: trstringer/manual-approval@v1
+        env:
+          APPROVERS: ${{ secrets.PRODUCTION_APPROVERS }}
+          MIN_APPROVALS: 2
+        with:
+          secret: ${{ github.token }}
+          approvers: ${{ env.APPROVERS }}
+          minimum-approvals: ${{ env.MIN_APPROVALS }}
+          issue-title: "Production Deployment Request: ${{ needs.build-and-scan.outputs.image-tag }}"
+          issue-body: |
+            ## Production Deployment Request
+            
+            **Deployment Details:**
+            - **Version:** ${{ needs.build-and-scan.outputs.image-tag }}
+            - **Commit:** [${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
+            - **Services:** ${{ join(fromJson(needs.validate-pipeline.outputs.service-matrix), ', ') }}
+            - **Deployed by:** ${{ github.actor }}
+            
+            **Quality Gates:**
+            - Code Quality: ✅ Passed
+            - Security Scanning: ✅ Passed
+            - Dependency Checks: ✅ Passed  
+            - SonarQube: ✅ Quality Gate Passed
+            
+            **Change Summary:**
+            ```diff
+            ${{ github.event.head_commit.message }}
+            ```
+            
+            **Risk Assessment:** [View Risk Report](${{ vars.RISK_ASSESSMENT_URL }})
+            
+            ## Approvers
+            Required approvers: ${{ env.APPROVERS }}
+            Minimum approvals: ${{ env.MIN_APPROVALS }}
+            
+            To approve, comment with: `✅ Approve`
+            To reject, comment with: `❌ Reject`
+            
+            **Note:** This deployment will automatically proceed after ${{ env.MIN_APPROVALS }} approvals.
+
+      - name: Wait for approvals
+        run: |
+          ./scripts/wait-for-approvals.sh \
+            --issue ${{ steps.approval.outputs.issue-number }} \
+            --min-approvals ${{ env.MIN_APPROVALS }} \
+            --timeout 3600
+
+  # Job 8: Deploy with Strategy
+  deploy-with-strategy:
+    name: Deploy with Strategy
+    needs:
+      - validate-pipeline
+      - push-secure-images
+      - update-gitops-repository
+      - production-approval
+    if: |
+      (needs.validate-pipeline.outputs.deploy-environment != 'production' ||
+       (needs.validate-pipeline.outputs.deploy-environment == 'production' &&
+        (github.event_name == 'workflow_dispatch' || needs.production-approval.outputs.approved == 'true')))
+    runs-on: ubuntu-latest
+    environment: ${{ needs.validate-pipeline.outputs.deploy-environment }}
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.validate-pipeline.outputs.service-matrix) }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: github-actions-${{ github.run_id }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ vars.AWS_REGION }} \
+            --name ${{ vars[format('{0}_EKS_CLUSTER', needs.validate-pipeline.outputs.deploy-environment)] }}
+
+      - name: Deploy based on strategy
+        run: |
+          STRATEGY="${{ needs.validate-pipeline.outputs.deployment-strategy }}"
+          SERVICE="${{ matrix.service }}"
+          IMAGE="${{ vars.CONTAINER_REGISTRY }}/$SERVICE:${{ needs.build-and-scan.outputs.image-tag }}"
+          ENV="${{ needs.validate-pipeline.outputs.deploy-environment }}"
+          
+          case $STRATEGY in
+            "recreate")
+              ./scripts/deploy-recreate.sh --service $SERVICE --image $IMAGE --environment $ENV
+              ;;
+            "rolling")
+              ./scripts/deploy-rolling.sh --service $SERVICE --image $IMAGE --environment $ENV
+              ;;
+            "blue-green")
+              ./scripts/deploy-blue-green.sh --service $SERVICE --image $IMAGE --environment $ENV
+              ;;
+            "canary")
+              ./scripts/deploy-canary.sh --service $SERVICE --image $IMAGE --environment $ENV
+              ;;
+            "emergency-rolling")
+              ./scripts/deploy-emergency.sh --service $SERVICE --image $IMAGE --environment $ENV
+              ;;
+          esac
+
+      - name: Wait for deployment rollout
+        run: |
+          kubectl rollout status deployment/${{ matrix.service }} \
+            --namespace ${{ needs.validate-pipeline.outputs.deploy-environment }} \
+            --timeout=300s
+
+      - name: Run health checks
+        run: |
+          ./scripts/run-health-checks.sh \
+            --service ${{ matrix.service }} \
+            --environment ${{ needs.validate-pipeline.outputs.deploy-environment }} \
+            --timeout 120
+
+      - name: Record successful deployment
+        if: success()
+        run: |
+          curl -X POST ${{ vars.DEPLOYMENT_REGISTRY_URL }}/api/deployments/${{ github.run_id }}/complete \
+            -H "Authorization: Bearer ${{ secrets.DEPLOYMENT_REGISTRY_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "service": "${{ matrix.service }}",
+              "status": "success",
+              "completed_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            }'
+
+  # Job 9: Post-Deployment Verification
+  post-deployment-verification:
+    name: Post-Deployment Verification
+    needs: [deploy-with-strategy]
+    if: always()
+    runs-on: ubuntu-latest
+    environment: ${{ needs.validate-pipeline.outputs.deploy-environment }}
+    steps:
+      - name: Verify deployed versions
+        run: |
+          ./scripts/verify-deployed-versions.sh \
+            --expected-tag ${{ needs.build-and-scan.outputs.image-tag }} \
+            --services ${{ join(fromJson(needs.validate-pipeline.outputs.service-matrix), ' ') }}
+
+      - name: Run smoke tests
+        if: success()
+        run: |
+          ./scripts/run-smoke-tests.sh \
+            --environment ${{ needs.validate-pipeline.outputs.deploy-environment }} \
+            --services ${{ join(fromJson(needs.validate-pipeline.outputs.service-matrix), ' ') }}
+
+      - name: Run performance tests (production only)
+        if: |
+          success() &&
+          needs.validate-pipeline.outputs.deploy-environment == 'production'
+        run: |
+          ./scripts/run-performance-tests.sh \
+            --duration 5m \
+            --concurrent-users 100
+
+      - name: Monitor for regressions
+        if: success()
+        run: |
+          # Start monitoring for 1 hour
+          timeout 3600 ./scripts/monitor-for-regressions.sh \
+            --services ${{ join(fromJson(needs.validate-pipeline.outputs.service-matrix), ' ') }} \
+            --environment ${{ needs.validate-pipeline.outputs.deploy-environment }}
+
+      - name: Auto-rollback on failure
+        if: failure()
+        run: |
+          ./scripts/auto-rollback.sh \
+            --services ${{ join(fromJson(needs.validate-pipeline.outputs.service-matrix), ' ') }} \
+            --environment ${{ needs.validate-pipeline.outputs.deploy-environment }} \
+            --reason "Post-deployment verification failed"
+
+  # Job 10: Notification & Reporting
+  notify-and-report:
+    name: Notification & Reporting
+    needs: [post-deployment-verification]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate deployment report
+        run: |
+          ./scripts/generate-deployment-report.sh \
+            --run-id ${{ github.run_id }} \
+            --environment ${{ needs.validate-pipeline.outputs.deploy-environment }} \
+            --status ${{ needs.post-deployment-verification.result }} \
+            --output report.json
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        with:
+          channel-id: ${{ vars.SLACK_CHANNEL_ID }}
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ needs.post-deployment-verification.result == 'success' && '✅ Deployment Successful' : '❌ Deployment Failed' }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Environment:*\n${{ needs.validate-pipeline.outputs.deploy-environment }}"
+                    },
+                    {
+                      "type": "mrkdwn", 
+                      "text": "*Version:*\n${{ needs.build-and-scan.outputs.image-tag }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Services:*\n${{ join(fromJson(needs.validate-pipeline.outputs.service-matrix), ', ') }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status:*\n${{ needs.post-deployment-verification.result }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Run Details:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View in GitHub>"
+                  }
+                }
+              ]
+            }
+
+      - name: Update deployment dashboard
+        run: |
+          curl -X POST ${{ vars.DEPLOYMENT_DASHBOARD_URL }}/api/update \
+            -H "Authorization: Bearer ${{ secrets.DEPLOYMENT_DASHBOARD_TOKEN }}" \
+            -d @report.json
+
+      - name: Send email report (production only)
+        if: needs.validate-pipeline.outputs.deploy-environment == 'production'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "Deployment Report: ${{ needs.build-and-scan.outputs.image-tag }} to Production"
+          to: ${{ secrets.EMAIL_RECIPIENTS }}
+          from: GitHub Actions <ci-cd@example.com>
+          body: |
+            Deployment ${{ needs.post-deployment-verification.result == 'success' ? 'succeeded' : 'failed' }}.
+            
+            Details:
+            - Environment: ${{ needs.validate-pipeline.outputs.deploy-environment }}
+            - Version: ${{ needs.build-and-scan.outputs.image-tag }}
+            - Services: ${{ join(fromJson(needs.validate-pipeline.outputs.service-matrix), ', ') }}
+            - Commit: ${{ github.sha }}
+            - Deployed by: ${{ github.actor }}
+            
+            View full report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  # Job 11: Rollback (Emergency)
+  emergency-rollback:
+    name: Emergency Rollback
+    if: |
+      failure() &&
+      contains(fromJson('["production", "canary", "emergency-production"]'), 
+               needs.validate-pipeline.outputs.deploy-environment)
+    needs: [validate-pipeline, post-deployment-verification]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.validate-pipeline.outputs.deploy-environment }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Get previous successful version
+        id: previous
+        run: |
+          PREVIOUS=$(curl -s \
+            "${{ vars.DEPLOYMENT_REGISTRY_URL }}/api/deployments/previous-successful?environment=${{ needs.validate-pipeline.outputs.deploy-environment }}" \
+            -H "Authorization: Bearer ${{ secrets.DEPLOYMENT_REGISTRY_TOKEN }}" \
+            | jq -r '.version')
+          
+          if [ -z "$PREVIOUS" ] || [ "$PREVIOUS" = "null" ]; then
+            echo "No previous successful deployment found"
+            exit 1
+          fi
+          
+          echo "previous-version=$PREVIOUS" >> $GITHUB_OUTPUT
+
+      - name: Execute rollback
+        run: |
+          for service in ${{ join(fromJson(needs.validate-pipeline.outputs.service-matrix), ' ') }}; do
+            ./scripts/rollback-service.sh \
+              --service $service \
+              --version ${{ steps.previous.outputs.previous-version }} \
+              --environment ${{ needs.validate-pipeline.outputs.deploy-environment }} \
+              --reason "Automatic rollback due to deployment failure"
+          done
+
+      - name: Notify rollback
+        uses: slackapi/slack-github-action@v1.24.0
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        with:
+          channel-id: ${{ vars.SLACK_ALERT_CHANNEL_ID }}
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "🚨 Automatic Rollback Executed"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Environment:*\n${{ needs.validate-pipeline.outputs.deploy-environment }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Rolled back from:*\n${{ needs.build-and-scan.outputs.image-tag }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Rolled back to:*\n${{ steps.previous.outputs.previous-version }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn", 
+                    "text": "*Reason:* Automatic rollback triggered due to deployment verification failure"
+                  }
+                }
+              ]
+            }
+
+# -------------------------------------------------------------------
+# SUPPORTING CONFIGURATION FILES
+# -------------------------------------------------------------------
+
+# .github/service-dependencies.yaml
+services:
+  - name: account-service
+    dependencies: []
+    deployment-order: 1
+    deployment-strategy: rolling
+    resource-limits:
+      cpu: "500m"
+      memory: "1Gi"
       
+  - name: transaction-service
+    dependencies: [account-service]
+    deployment-order: 2
+    deployment-strategy: rolling
+    resource-limits:
+      cpu: "1"
+      memory: "2Gi"
       
+  - name: user-service
+    dependencies: [account-service]
+    deployment-order: 2
+    deployment-strategy: rolling
+    resource-limits:
+      cpu: "500m"
+      memory: "1Gi"
+
+
+# .github/environments/development.yaml
+name: development
+deployment-branch-policy:
+  protected-branches: false
+  custom-branch-policies: true
+environment-variables:
+  CONTAINER_REGISTRY: 123456789012.dkr.ecr.us-east-1.amazonaws.com/dev
+  EKS_CLUSTER: dev-cluster
+  DOMAIN_SUFFIX: .dev.example.com
+protection-rules: []
+
+# .github/environments/production.yaml
+name: production
+deployment-branch-policy:
+  protected-branches: true
+  custom-branch-policies: false
+environment-variables:
+  CONTAINER_REGISTRY: 123456789012.dkr.ecr.us-east-1.amazonaws.com/prod
+  EKS_CLUSTER: prod-cluster
+  DOMAIN_SUFFIX: .example.com
+protection-rules:
+  required_reviewers:
+    teams:
+      - production-approvers
+  wait_timer:
+    minutes: 30
+  deployment_branch_policy:
+    protected_branches: true
+
+
+# .github/pipeline-config.yaml
+version: 1
+sla:
+  build-time: 600  # 10 minutes
+  deployment-time: 1200  # 20 minutes
+  total-time: 1800  # 30 minutes
+  
+notifications:
+  slack:
+    channel-id: "C12345678"
+    success-emoji: "✅"
+    failure-emoji: "❌"
+    warning-emoji: "⚠️"
+    
+  email:
+    recipients:
+      - devops@example.com
+      - engineering-leads@example.com
+      
+security:
+  container-scanning:
+    severity-threshold: "HIGH"
+    ignore-unfixed: true
+    fail-on-threshold: true
+    
+  dependency-scanning:
+    cvss-threshold: 7.0
+    fail-on-threshold: true
+    
+  secrets-scanning:
+    enabled: true
+    pattern: "github_token|aws_secret|private_key"
+    
+deployment:
+  strategies:
+    development:
+      type: recreate
+      max-unavailable: 100%
+      
+    staging:
+      type: rolling
+      max-unavailable: 0
+      max-surge: 1
+      
+    production:
+      type: blue-green
+      verification-timeout: 300
+      auto-rollback: true
+
+
+
+      Key Improvements Over Original Pipeline:
+1. Security Enhancements:
+✅ Image signing with Cosign (immutable provenance)
+
+✅ SBOM generation & attestation (software transparency)
+
+✅ Multi-stage security scanning (SAST, DAST, container)
+
+✅ Secret scanning & rotation support
+
+✅ Vulnerability management with allowlists
+
+2. Deployment Strategy Improvements:
+✅ Multi-environment support (dev, staging, canary, production)
+
+✅ Multiple deployment strategies (rolling, blue-green, canary)
+
+✅ Automatic rollback on failure
+
+✅ Health checks & verification
+
+✅ Deployment windows & scheduling
+
+3. Reliability & Resilience:
+✅ Distributed locks for GitOps updates
+
+✅ Atomic updates for multi-service deployments
+
+✅ Deployment registry for tracking & rollback
+
+✅ Pipeline monitoring & observability
+
+✅ Failure recovery & self-healing
+
+4. Enterprise Features:
+✅ Manual approval gates for production
+
+✅ Audit trail & compliance reporting
+
+✅ Resource quotas & limits
+
+✅ Service dependency management
+
+✅ Performance testing integration
+
+5. Operational Excellence:
+✅ Centralized configuration management
+
+✅ Comprehensive notifications (Slack, Email, Dashboard)
+
+✅ Pipeline SLAs & performance tracking
+
+✅ Emergency procedures & hotfix support
+
+✅ Disaster recovery capabilities
+
+Deployment Flow:
+text
+1. Trigger → 2. Validation → 3. Quality Gates → 4. Security Scanning
+      ↓
+5. Build & Sign → 6. Update GitOps → 7. Approval Gates (if production)
+      ↓
+8. Strategy Deployment → 9. Verification → 10. Monitoring
+      ↓
+11. Rollback (if failed) → 12. Notification & Reporting
+Usage Examples:
+1. Development Deployment (Auto)
+bash
+git push origin feature/new-feature
+# Auto-deploys to development environment
+2. Staging Deployment (Auto with tests)
+bash
+git push origin develop
+# Auto-deploys to staging with integration tests
+3. Production Deployment (Manual approval)
+bash
+# Create a release
+git tag v1.2.3
+git push origin v1.2.3
+
+# Or use workflow dispatch
+# Requires 2 approvals from production-approvers team
+4. Emergency Hotfix
+bash
+git checkout -b hotfix/critical-bug main
+# Fix the bug
+git push origin hotfix/critical-bug
+# Fast-track deployment with emergency procedures
+5. Rollback
+bash
+# Via GitHub UI workflow dispatch
+Action: rollback
+Environment: production
+Version: v1.2.2 (previous working version)
+This enterprise pipeline provides security, reliability, and compliance while maintaining developer productivity and operational efficiency.
