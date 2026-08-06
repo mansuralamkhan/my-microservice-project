@@ -1,0 +1,1190 @@
+# ==================================================================
+# ENTERPRISE REUSABLE BUILD WORKFLOW
+#
+# File:
+#   .github/workflows/reusable-build.yml
+#
+# Purpose:
+#
+#   Reusable CI workflow for Java/Spring Boot microservices.
+#
+#
+# VALIDATION MODE
+# ----------------
+#
+# push-image: false
+#
+# Used for:
+#
+#   Pull Requests
+#   Manual validation
+#
+# Flow:
+#
+#   Checkout
+#      ↓
+#   Java Setup
+#      ↓
+#   Maven Build + Test
+#      ↓
+#   SonarQube
+#      ↓
+#   Docker Build (Local Image)
+#      ↓
+#   SBOM
+#      ↓
+#   Trivy Scan
+#
+# NO AWS authentication.
+# NO ECR login.
+# NO image push.
+# NO image signing.
+# NO deployment metadata.
+#
+#
+# PUBLISH MODE
+# ------------
+#
+# push-image: true
+#
+# Flow:
+#
+#   Build
+#      ↓
+#   Test
+#      ↓
+#   Scan
+#      ↓
+#   AWS OIDC
+#      ↓
+#   ECR Login
+#      ↓
+#   Push Image
+#      ↓
+#   Capture Immutable Digest
+#      ↓
+#   Build Provenance Attestation
+#      ↓
+#   Cosign Sign
+#      ↓
+#   Deployment Metadata
+#
+#
+# IMPORTANT:
+#
+# This workflow NEVER deploys to Kubernetes.
+#
+# CI produces artifacts.
+#
+# CD consumes artifacts and updates GitOps.
+#
+# ==================================================================
+
+name: Reusable Build Workflow
+
+
+# ==================================================================
+# REUSABLE WORKFLOW INTERFACE
+#
+# DESIGN RULE:
+#
+#   This workflow is intentionally environment-independent.
+#
+#   It accepts build/publish inputs only. It does NOT accept:
+#
+#     environment
+#     namespace
+#     cluster
+#     Argo CD application
+#
+#   Deployment-environment decisions belong to CD/GitOps workflows.
+#
+#   This separation prevents CI validation from being coupled to
+#   development, staging, or production deployment configuration.
+# ==================================================================
+
+on:
+
+  workflow_call:
+
+    inputs:
+
+
+      # ------------------------------------------------------------
+      # Microservice name.
+      #
+      # Example:
+      #
+      # payment-service
+      # ------------------------------------------------------------
+
+      service-name:
+
+        description: "Name of the microservice"
+
+        required: true
+
+        type: string
+
+
+      # ------------------------------------------------------------
+      # Dockerfile location.
+      #
+      # Example:
+      #
+      # services/payment-service/Dockerfile
+      # ------------------------------------------------------------
+
+      dockerfile:
+
+        description: "Path to Dockerfile"
+
+        required: true
+
+        type: string
+
+
+      # ------------------------------------------------------------
+      # Java version.
+      # ------------------------------------------------------------
+
+      java-version:
+
+        description: "Java version"
+
+        required: false
+
+        default: "21"
+
+        type: string
+
+
+      # ------------------------------------------------------------
+      # AWS Region.
+      #
+      # Used ONLY when:
+      #
+      # push-image == true
+      # ------------------------------------------------------------
+
+      aws-region:
+
+        description: "AWS region"
+
+        required: false
+
+        default: "ap-south-1"
+
+        type: string
+
+
+      # ------------------------------------------------------------
+      # ECR Repository.
+      #
+      # Example:
+      #
+      # payment-service
+      #
+      # Used ONLY when:
+      #
+      # push-image == true
+      # ------------------------------------------------------------
+
+      ecr-repository:
+
+        description: "ECR repository name"
+
+        required: true
+
+        type: string
+
+
+      # ------------------------------------------------------------
+      # Controls whether this workflow publishes an image.
+      #
+      # This is the only mode switch required by this reusable workflow.
+      # There is intentionally no deployment-environment input.
+      #
+      # false:
+      #
+      #   validation mode
+      #
+      # true:
+      #
+      #   publish mode
+      # ------------------------------------------------------------
+
+      push-image:
+
+        description: "Push image to ECR"
+
+        required: false
+
+        default: false
+
+        type: boolean
+
+
+    # ==============================================================
+    # OUTPUTS
+    #
+    # Used by callers when an image was published.
+    # ==============================================================
+
+    outputs:
+
+
+      image-tag:
+
+        description: "Immutable Git SHA image tag"
+
+        value: ${{ jobs.build.outputs.image-tag }}
+
+
+      image-uri:
+
+        description: "Full ECR image URI"
+
+        value: ${{ jobs.build.outputs.image-uri }}
+
+
+      image-digest:
+
+        description: "Immutable container image digest"
+
+        value: ${{ jobs.build.outputs.image-digest }}
+
+
+# ==================================================================
+# PERMISSIONS
+#
+# IMPORTANT:
+#
+# id-token: write is required for AWS OIDC when publishing.
+#
+# GitHub permissions cannot currently be dynamically enabled based
+# on an input, so the workflow declares the permission here.
+#
+# However, AWS authentication is never performed unless:
+#
+# push-image == true
+#
+# AWS IAM OIDC trust policies remain the final authorization layer.
+# ==================================================================
+
+# ==================================================================
+# EXPLICIT SECRET CONTRACT
+#
+# Do not use `secrets: inherit` for this reusable workflow.
+# Callers must pass only the credentials this workflow consumes.
+# This makes secret exposure reviewable and prevents newly-created
+# repository/environment secrets from being implicitly exposed here.
+# ==================================================================
+
+    secrets:
+
+      AWS_ROLE_ARN:
+        required: true
+
+      SONAR_HOST_URL:
+        required: true
+
+      SONAR_TOKEN:
+        required: true
+
+# ==================================================================
+# REUSABLE WORKFLOW TOKEN PERMISSIONS
+#
+# id-token: write is required by the publishing path for:
+#
+#   - AWS OIDC federation
+#   - Cosign keyless signing
+#
+# CALLER CONTRACT:
+#
+# A reusable workflow cannot increase GITHUB_TOKEN permissions that
+# were not granted by its caller. Therefore any caller using
+# push-image=true must also grant:
+#
+#   permissions:
+#     contents: read
+#     id-token: write
+#     attestations: write
+#
+# ci.yml grants this only to build-services. Validation callers remain
+# read-only and do not receive OIDC permission.
+#
+# AWS IAM trust policy remains the final authorization boundary for
+# AWS role assumption.
+# ==================================================================
+
+permissions:
+
+  contents: read
+
+  id-token: write
+
+  # Required to create build-provenance attestations for published
+  # release artifacts.
+  attestations: write
+
+
+jobs:
+
+
+  # =================================================================
+  # BUILD JOB
+  # =================================================================
+
+  build:
+
+    name: Build ${{ inputs.service-name }}
+
+    runs-on: ubuntu-latest
+
+
+    outputs:
+
+      image-tag: ${{ steps.final-metadata.outputs.image-tag }}
+
+      image-uri: ${{ steps.final-metadata.outputs.image-uri }}
+
+      image-digest: ${{ steps.image-digest.outputs.digest }}
+
+
+    env:
+
+      # ------------------------------------------------------------
+      # Immutable source version.
+      #
+      # Full SHA is preferred over shortened SHA because it avoids
+      # ambiguity in large repositories.
+      # ------------------------------------------------------------
+
+      IMAGE_TAG: ${{ github.sha }}
+
+
+    steps:
+
+
+      # =============================================================
+      # STEP 1
+      #
+      # CHECKOUT SOURCE CODE
+      # =============================================================
+
+      - name: Checkout Repository
+
+        uses: actions/checkout@v4
+
+
+
+      # =============================================================
+      # STEP 2
+      #
+      # SETUP JAVA
+      #
+      # Maven dependency caching is handled automatically.
+      # =============================================================
+
+      - name: Setup Java
+
+        uses: actions/setup-java@v4
+
+        with:
+
+          distribution: temurin
+
+          java-version: ${{ inputs.java-version }}
+
+          cache: maven
+
+
+
+      # =============================================================
+      # STEP 3
+      #
+      # BUILD + TEST
+      #
+      # mvn verify runs the Maven lifecycle through:
+      #
+      # compile
+      # test
+      # package
+      # integration-test
+      # verify
+      #
+      # This avoids unnecessarily running:
+      #
+      # mvn package
+      #
+      # followed by:
+      #
+      # mvn test
+      #
+      # which would duplicate work.
+      # =============================================================
+
+      - name: Build and Test
+
+        working-directory: services/${{ inputs.service-name }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+
+          mvn \
+            clean \
+            verify \
+            -B \
+            -ntp
+
+
+
+      # =============================================================
+      # STEP 4
+      #
+      # SONARQUBE ANALYSIS
+      #
+      # These should ideally be organization/repository CI secrets,
+      # NOT deployment environment secrets.
+      #
+      # Required:
+      #
+      # SONAR_HOST_URL
+      # SONAR_TOKEN
+      #
+      # This allows PR validation without accessing Dev/Staging/Prod
+      # environment secrets.
+      # =============================================================
+
+      - name: SonarQube Analysis
+
+        working-directory: services/${{ inputs.service-name }}
+
+        env:
+
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+
+          # Uploading analysis is not the release gate.
+          # Wait for SonarQube to calculate the server-side Quality Gate.
+          #
+          # FAILED gate  -> Maven exits non-zero -> workflow stops.
+          # PASSED gate  -> workflow may continue toward image publishing.
+          #
+          # The timeout prevents a SonarQube outage from holding a runner
+          # indefinitely. Tune this only through an approved CI standard.
+
+          mvn \
+            sonar:sonar \
+            -B \
+            -ntp \
+            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.token="${SONAR_TOKEN}" \
+            -Dsonar.qualitygate.wait=true \
+            -Dsonar.qualitygate.timeout=300
+
+
+
+
+      # =============================================================
+      # STEP 5
+      #
+      # GENERATE LOCAL IMAGE NAME
+      #
+      # This image name is always available.
+      #
+      # PR example:
+      #
+      # payment-service:ci-a8f91d2...
+      #
+      # This allows:
+      #
+      # Docker Build
+      # SBOM
+      # Trivy
+      #
+      # without requiring AWS or ECR.
+      # =============================================================
+
+      - name: Generate Local Image Metadata
+
+        id: local-image
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+
+          LOCAL_IMAGE="${{ inputs.service-name }}:ci-${IMAGE_TAG}"
+
+
+          echo "Local image: ${LOCAL_IMAGE}"
+
+
+          echo "uri=${LOCAL_IMAGE}" \
+            >> "$GITHUB_OUTPUT"
+
+
+
+      # =============================================================
+      # STEP 6
+      #
+      # BUILD LOCAL DOCKER IMAGE
+      #
+      # The same locally built image is:
+      #
+      #   scanned
+      #   tagged for ECR
+      #   pushed
+      #
+      # We do NOT rebuild the image after scanning.
+      #
+      # This is important:
+      #
+      # BUILD ONCE → SCAN → PUBLISH SAME IMAGE
+      # =============================================================
+
+      - name: Build Docker Image
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+
+          docker build \
+            --file "${{ inputs.dockerfile }}" \
+            --tag "${{ steps.local-image.outputs.uri }}" \
+            "services/${{ inputs.service-name }}"
+
+
+
+      # =============================================================
+      # STEP 7
+      #
+      # GENERATE SBOM
+      #
+      # Software Bill of Materials.
+      #
+      # Useful for:
+      #
+      # vulnerability management
+      # compliance
+      # incident response
+      # software supply-chain visibility
+      # =============================================================
+
+      - name: Generate SBOM
+
+        uses: anchore/sbom-action@v0
+
+        with:
+
+          image: ${{ steps.local-image.outputs.uri }}
+
+          artifact-name: >-
+            ${{ inputs.service-name }}-sbom-${{ github.sha }}.spdx.json
+
+          output-file: >-
+            ${{ inputs.service-name }}-sbom.spdx.json
+
+
+
+      # =============================================================
+      # STEP 8
+      #
+      # TRIVY SECURITY SCAN
+      #
+      # Pipeline fails if:
+      #
+      # HIGH
+      #
+      # or
+      #
+      # CRITICAL
+      #
+      # vulnerabilities are found.
+      #
+      # ignore-unfixed=true avoids blocking releases for CVEs where
+      # no vendor fix currently exists.
+      #
+      # Enterprise teams may choose a stricter policy.
+      # =============================================================
+
+      - name: Scan Docker Image with Trivy
+
+        uses: aquasecurity/trivy-action@0.28.0
+
+        with:
+
+          image-ref: ${{ steps.local-image.outputs.uri }}
+
+          severity: HIGH,CRITICAL
+
+          ignore-unfixed: true
+
+          exit-code: "1"
+
+
+
+      # =============================================================
+      # EVERYTHING BELOW THIS POINT IS PUBLISH MODE ONLY
+      #
+      # The following steps execute ONLY when:
+      #
+      # push-image == true
+      #
+      # PR validation therefore never:
+      #
+      #   authenticates to AWS
+      #
+      #   logs into ECR
+      #
+      #   pushes images
+      #
+      #   signs images
+      #
+      # =============================================================
+
+
+
+      # =============================================================
+      # STEP 9
+      #
+      # AWS AUTHENTICATION
+      #
+      # Uses GitHub OIDC.
+      #
+      # No long-lived:
+      #
+      # AWS_ACCESS_KEY_ID
+      #
+      # AWS_SECRET_ACCESS_KEY
+      #
+      # AWS_ROLE_ARN should be supplied as a secret available to the
+      # calling workflow.
+      #
+      # AWS IAM trust policy must independently restrict which GitHub
+      # repository/ref/environment can assume the role.
+      # =============================================================
+
+      - name: Configure AWS Credentials
+
+        if: inputs.push-image
+
+        uses: aws-actions/configure-aws-credentials@v4
+
+        with:
+
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+
+          aws-region: ${{ inputs.aws-region }}
+
+          role-session-name: >-
+            github-${{ inputs.service-name }}-${{ github.run_id }}
+
+
+
+      # =============================================================
+      # STEP 10
+      #
+      # LOGIN TO AMAZON ECR
+      # =============================================================
+
+      - name: Login to Amazon ECR
+
+        if: inputs.push-image
+
+        id: login-ecr
+
+        uses: aws-actions/amazon-ecr-login@v2
+
+
+
+      # =============================================================
+      # STEP 11
+      #
+      # GENERATE FINAL ECR IMAGE URI
+      #
+      # Example:
+      #
+      # 111111111111.dkr.ecr.ap-south-1.amazonaws.com/
+      # payment-service:<git-sha>
+      # =============================================================
+
+      - name: Generate Final Image Metadata
+
+        if: inputs.push-image
+
+        id: final-metadata
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}:${IMAGE_TAG}"
+
+
+          echo "Final Image URI:"
+
+          echo "${IMAGE_URI}"
+
+
+          echo "image-tag=${IMAGE_TAG}" \
+            >> "$GITHUB_OUTPUT"
+
+
+          echo "image-uri=${IMAGE_URI}" \
+            >> "$GITHUB_OUTPUT"
+            
+
+
+
+      # =============================================================
+      # STEP 12
+      #
+      # TAG LOCAL IMAGE FOR ECR
+      #
+      # IMPORTANT:
+      #
+      # We are NOT rebuilding.
+      #
+      # We take the exact local image that passed Trivy:
+      #
+      # payment-service:ci-SHA
+      #
+      # and add an ECR tag:
+      #
+      # account.dkr.ecr.../payment-service:SHA
+      #
+      # Both tags point to the same local Docker image ID.
+      # =============================================================
+
+      - name: Tag Docker Image for ECR
+
+        if: inputs.push-image
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+
+          docker tag \
+            "${{ steps.local-image.outputs.uri }}" \
+            "${{ steps.final-metadata.outputs.image-uri }}"
+
+
+
+      # =============================================================
+      # STEP 13
+      #
+      # PUSH IMAGE TO ECR
+      #
+      # Only the image that already passed:
+      #
+      # build
+      # tests
+      # SonarQube
+      # SBOM generation
+      # Trivy
+      #
+      # reaches ECR.
+      # =============================================================
+
+      - name: Push Docker Image
+
+        if: inputs.push-image
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+
+          docker push \
+            "${{ steps.final-metadata.outputs.image-uri }}"
+
+
+
+      # =============================================================
+      # STEP 14
+      #
+      # GET IMMUTABLE IMAGE DIGEST
+      #
+      # Example:
+      #
+      # sha256:abcdef123456...
+      #
+      # Git tags are useful for traceability.
+      #
+      # Digests are used for immutable artifact identity.
+      # =============================================================
+
+      - name: Get Image Digest
+
+        if: inputs.push-image
+
+        id: image-digest
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+
+          DIGEST=$(
+
+            aws ecr describe-images \
+              --repository-name "${{ inputs.ecr-repository }}" \
+              --image-ids imageTag="${IMAGE_TAG}" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text
+
+          )
+
+
+          if [[ -z "${DIGEST}" ]] || \
+             [[ "${DIGEST}" == "None" ]]; then
+
+
+            echo "ERROR:"
+
+            echo "Unable to retrieve ECR image digest."
+
+
+            exit 1
+
+
+          fi
+
+
+          if [[ ! "${DIGEST}" =~ ^sha256: ]]; then
+
+
+            echo "ERROR:"
+
+            echo "Invalid image digest: ${DIGEST}"
+
+
+            exit 1
+
+
+          fi
+
+
+          echo "Image Digest:"
+
+          echo "${DIGEST}"
+
+
+          echo "digest=${DIGEST}" \
+            >> "$GITHUB_OUTPUT"
+
+
+
+      # =============================================================
+      # STEP 15
+      #
+      # INSTALL COSIGN
+      # =============================================================
+
+      - name: Install Cosign
+
+        if: inputs.push-image
+
+        uses: sigstore/cosign-installer@v3
+
+
+
+      # =============================================================
+      # STEP 16
+      #
+      # SIGN IMMUTABLE IMAGE DIGEST
+      #
+      # We sign:
+      #
+      # repository@sha256:...
+      #
+      # NOT:
+      #
+      # repository:tag
+      #
+      # This ensures the signature belongs to the exact immutable
+      # container artifact.
+      # =============================================================
+
+      # =============================================================
+      # BUILD PROVENANCE ATTESTATION
+      #
+      # At this point the image has been pushed and its immutable digest
+      # has already been captured.
+      #
+      # The attestation establishes verifiable provenance linking the
+      # published OCI artifact to the GitHub workflow/build identity.
+      #
+      # This gives downstream promotion controls evidence for:
+      #
+      #   "Which trusted workflow produced this exact digest?"
+      #
+      # It runs only in publish mode because validation mode does not
+      # create a release artifact in ECR.
+      # =============================================================
+
+      - name: Attest Container Build Provenance
+
+        if: ${{ inputs.push-image }}
+
+        uses: actions/attest-build-provenance@v3
+
+        with:
+
+          subject-name: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}
+
+          subject-digest: ${{ steps.image-digest.outputs.digest }}
+
+          push-to-registry: true
+
+
+
+      - name: Sign Docker Image
+
+        if: inputs.push-image
+
+        env:
+
+          IMAGE_REPOSITORY: >-
+            ${{ steps.login-ecr.outputs.registry }}/${{
+            inputs.ecr-repository }}
+
+          IMAGE_DIGEST: ${{ steps.image-digest.outputs.digest }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+
+          cosign sign \
+            --yes \
+            "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"
+
+
+
+      # =============================================================
+      # STEP 17
+      #
+      # CREATE DEPLOYMENT METADATA
+      #
+      # Each service creates one JSON file.
+      #
+      # Example:
+      #
+      # payment-service.json
+      #
+      # {
+      #
+      #   "service": "payment-service",
+      #
+      #   "repository": "payment-service",
+      #
+      #   "tag": "abc123",
+      #
+      #   "digest": "sha256:...",
+      #
+      #   "uri": "account.dkr.ecr..."
+      #
+      # }
+      #
+      # ci.yml aggregates these files into:
+      #
+      # deployment-manifest.json
+      # =============================================================
+
+      - name: Create Deployment Metadata
+
+        if: inputs.push-image
+
+        env:
+
+          SERVICE_NAME: ${{ inputs.service-name }}
+
+          ECR_REPOSITORY: ${{ inputs.ecr-repository }}
+
+          IMAGE_TAG: ${{ steps.final-metadata.outputs.image-tag }}
+
+          IMAGE_URI: ${{ steps.final-metadata.outputs.image-uri }}
+
+          IMAGE_DIGEST: ${{ steps.image-digest.outputs.digest }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+
+          mkdir \
+            -p \
+            deployment-metadata
+
+
+          jq \
+            -n \
+            --arg service "${SERVICE_NAME}" \
+            --arg repository "${ECR_REPOSITORY}" \
+            --arg tag "${IMAGE_TAG}" \
+            --arg digest "${IMAGE_DIGEST}" \
+            --arg uri "${IMAGE_URI}" \
+            '
+
+            {
+
+              service: $service,
+
+              repository: $repository,
+
+              tag: $tag,
+
+              digest: $digest,
+
+              uri: $uri
+
+            }
+
+            ' \
+            > "deployment-metadata/${SERVICE_NAME}.json"
+
+
+          echo "Deployment Metadata:"
+
+
+          jq \
+            '.' \
+            "deployment-metadata/${SERVICE_NAME}.json"
+
+
+
+      # =============================================================
+      # STEP 18
+      #
+      # UPLOAD SERVICE DEPLOYMENT METADATA
+      #
+      # Matrix builds produce:
+      #
+      # deployment-metadata-payment-service
+      #
+      # deployment-metadata-order-service
+      #
+      # deployment-metadata-user-service
+      #
+      # ci.yml later aggregates them.
+      # =============================================================
+
+      - name: Upload Deployment Metadata
+
+        if: inputs.push-image
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: deployment-metadata-${{ inputs.service-name }}
+
+          path: >-
+            deployment-metadata/${{ inputs.service-name }}.json
+
+          retention-days: 30
+
+          if-no-files-found: error
+
+
+
+      # =============================================================
+      # STEP 19
+      #
+      # UPLOAD SBOM
+      #
+      # Runs for both:
+      #
+      # PR validation
+      #
+      # and
+      #
+      # publish builds
+      #
+      # Useful for audit and security investigation.
+      # =============================================================
+
+      - name: Upload SBOM
+
+        if: always()
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: >-
+            ${{ inputs.service-name }}-sbom-${{ github.sha }}
+
+          path: >-
+            ${{ inputs.service-name }}-sbom.spdx.json
+
+          if-no-files-found: ignore
+
+          retention-days: 30
+
+
+
+      # =============================================================
+      # STEP 20
+      #
+      # UPLOAD TEST REPORTS
+      #
+      # always() ensures test reports are preserved even when
+      # Maven tests fail.
+      # =============================================================
+
+      - name: Upload Test Reports
+
+        if: always()
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: >-
+            ${{ inputs.service-name }}-test-reports-${{ github.sha }}
+
+          path: |
+
+            services/${{ inputs.service-name }}/target/surefire-reports/
+
+            services/${{ inputs.service-name }}/target/failsafe-reports/
+
+          if-no-files-found: ignore
+
+          retention-days: 14
