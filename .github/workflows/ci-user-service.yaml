@@ -1,316 +1,55 @@
-
-# ==================================================================
-# ENTERPRISE CI ORCHESTRATION WORKFLOW
-#
-# File:
-#   .github/workflows/ci.yml
-#
-# Purpose:
-#
-#   Pull Request:
-#       Detect Changes  
-#           ↓
-#       Build + Test + Scan
-#           ↓
-#       NO ECR Push
-#           ↓
-#       CI Status Gate
-#
-#
-#   Push to Environment Branch:
-#       Detect Changes
-#           ↓
-#       Resolve Environment
-#           ↓
-#       Build + Test + Scan
-#           ↓
-#       Push Immutable Image
-#           ↓
-#       Sign Image
-#           ↓
-#       Generate Deployment Metadata
-#           ↓
-#       Aggregate Deployment Manifest
-#           ↓
-#       CI Status Gate
-#
-#
-# IMPORTANT:
-#
-#   CI DOES NOT DEPLOY TO EKS.
-#
-#   CI produces trusted deployment artifacts.
-#
-#   CD consumes:
-#
-#       deployment-manifest.json
-#
-#   and updates the GitOps repository.
-#
-# ==================================================================
-
 name: CI Pipeline
 
-
-# ==================================================================
-# WORKFLOW TRIGGERS
-# ==================================================================
-
 on:
-
-  # ----------------------------------------------------------------
-  # Pull Requests
-  #
-  # PRs validate code before merge.
-  #
-  # Examples:
-  #
-  # feature/login
-  #       ↓
-  #      dev
-  #
-  # dev
-  #       ↓
-  #    staging
-  #
-  # staging
-  #       ↓
-  #     main
-  #
-  # PR builds NEVER publish deployable images.
-  # ----------------------------------------------------------------
-
   pull_request:
-
     branches:
-
       - dev
-
       - staging
-
       - main
-
-
-  # ----------------------------------------------------------------
-  # Push Events
-  #
-  # Normally caused by merging an approved Pull Request.
-  #
-  # Push builds:
-  #
-  #   Build
-  #   Test
-  #   Scan
-  #   Publish
-  #   Sign
-  #   Generate Deployment Manifest
-  # ----------------------------------------------------------------
-
   push:
-
     branches:
-
       - dev
-
-
-  # ----------------------------------------------------------------
-  # Manual Execution
-  #
-  # Useful for:
-  #
-  #   troubleshooting
-  #   testing pipeline changes
-  #
-  # Manual execution is validation-only in this design.
-  #
-  # It does NOT automatically publish images.
-  # ----------------------------------------------------------------
-
   workflow_dispatch:
 
-
-# ==================================================================
-# CONCURRENCY
-#
-# Prevent outdated CI runs for the same branch or PR.
-#
-# Example:
-#
-# feature/login Push A
-#       │
-#       ▼
-# CI Run 100
-#
-# feature/login Push B
-#       │
-#       ▼
-# CI Run 100 cancelled
-# CI Run 101 starts
-#
-#
-# main and dev use different concurrency groups.
-#
-# Therefore:
-#
-# dev CI does NOT cancel main CI.
-# ==================================================================
-
 concurrency:
-
   group: ci-${{ github.workflow }}-${{ github.ref }}
-
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-
-# ==================================================================
-# DEFAULT TOKEN PERMISSIONS
-#
-# Principle of Least Privilege.
-#
-# Individual reusable workflows request additional permissions
-# when required.
-#
-# IMPORTANT:
-# Keep this workflow-level baseline read-only. OIDC permission is
-# granted only to the build-services reusable-workflow caller below.
-# This prevents PR validation and unrelated CI jobs from receiving
-# an unnecessary federated identity token.
-# ==================================================================
-
 permissions:
-
   contents: read
-
   actions: read
-
 
 jobs:
 
-
-  # =================================================================
-  # JOB 1
-  #
-  # DETECT CHANGED MICROSERVICES
-  #
-  # Instead of rebuilding every microservice, determine which
-  # services were affected.
-  #
-  # Expected repository:
-  #
-  # services/
-  #
-  #   payment-service/
-  #
-  #   order-service/
-  #
-  #   user-service/
-  #
-  #
-  # Example changed file:
-  #
-  # services/payment-service/src/main/java/Payment.java
-  #
-  # Result:
-  #
-  # payment-service
-  #
-  # =================================================================
-
   detect-changes:
-
     name: Detect Changed Services
-
     runs-on: ubuntu-latest
-
-
     outputs:
-
       matrix: ${{ steps.detect.outputs.matrix }}
-
       has-changes: ${{ steps.detect.outputs.has-changes }}
-
-
     steps:
-
-
-      # =============================================================
-      # Checkout Full Repository History
-      #
-      # fetch-depth: 0 is required for reliable merge-base
-      # calculations during PR comparisons.
-      # =============================================================
-
       - name: Checkout Repository
-
         uses: actions/checkout@v4
-
         with:
-
           fetch-depth: 0
 
-
-      # =============================================================
-      # Detect Changed Services
-      # =============================================================
-
       - name: Detect Changed Services
-
         id: detect
-
         shell: bash
-
         run: |
-
           set -euo pipefail
           echo "Event: ${{ github.event_name }}"
 
-          # ---------------------------------------------------------
-          # PULL REQUEST
-          #
-          # Use three-dot comparison.
-          #
-          # Example:
-          #
-          #                D ---- E
-          #               /
-          # A ---- B ---- C ---- F ---- G
-          #
-          # Merge Base = C
-          #
-          # Compare:
-          #
-          # C → E
-          #
-          # This shows only changes introduced by the PR.
-          # ---------------------------------------------------------
-
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-
             BASE_REF="${{ github.base_ref }}"
             echo "Pull Request detected."
             echo "Target branch: ${BASE_REF}"
 
-            git fetch \
-              origin \
-              "${BASE_REF}"
+            git fetch origin "${BASE_REF}"
 
-            CHANGED_FILES=$(
-
-              git diff \
-                --name-only \
-                "origin/${BASE_REF}...HEAD"
-            )
-
-          # ---------------------------------------------------------
-          # PUSH
-          #
-          # Compare repository state before and after the push.
-          #
-          # This correctly handles pushes containing multiple commits.
-          # ---------------------------------------------------------
+            CHANGED_FILES=$(git diff --name-only "origin/${BASE_REF}...HEAD")
 
           elif [[ "${{ github.event_name }}" == "push" ]]; then
-
             BEFORE_SHA="${{ github.event.before }}"
             CURRENT_SHA="${{ github.sha }}"
 
@@ -318,451 +57,121 @@ jobs:
             echo "Before SHA: ${BEFORE_SHA}"
             echo "Current SHA: ${CURRENT_SHA}"
 
-            # -------------------------------------------------------
-            # Zero SHA can occur for newly created branches.
-            # -------------------------------------------------------
-
-            if [[ "${BEFORE_SHA}" == \
-              "0000000000000000000000000000000000000000" ]]; then
-
+            if [[ "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]]; then
               echo "New branch detected."
 
-
-              # If parent commit exists, compare against it.
-              #
-              # Otherwise list all files from current commit.
-
               if git rev-parse "${CURRENT_SHA}^" >/dev/null 2>&1; then
-
-
-                CHANGED_FILES=$(
-
-                  git diff \
-                    --name-only \
-                    "${CURRENT_SHA}^" \
-                    "${CURRENT_SHA}"
-                )
-
+                CHANGED_FILES=$(git diff --name-only "${CURRENT_SHA}^" "${CURRENT_SHA}")
               else
-
-                CHANGED_FILES=$(
-
-                  git ls-tree \
-                    -r \
-                    --name-only \
-                    "${CURRENT_SHA}"
-                )
-
+                CHANGED_FILES=$(git ls-tree -r --name-only "${CURRENT_SHA}")
               fi
-
             else
-
-              CHANGED_FILES=$(
-
-                git diff \
-                  --name-only \
-                  "${BEFORE_SHA}" \
-                  "${CURRENT_SHA}"
-              )
-
+              CHANGED_FILES=$(git diff --name-only "${BEFORE_SHA}" "${CURRENT_SHA}")
             fi
 
-          # ---------------------------------------------------------
-          # MANUAL WORKFLOW
-          #
-          # Build all services.
-          #
-          # Since there may be no reliable previous event SHA,
-          # manual execution performs full validation.
-          # ---------------------------------------------------------
-
           else
-
             echo "Manual workflow detected."
-
             echo "All services will be validated."
 
-            CHANGED_FILES=$(
-
-              find services \
-                -mindepth 2 \
-                -maxdepth 2 \
-                -name Dockerfile \
-                -printf '%h\n'
-
-            )
-
-
+            CHANGED_FILES=$(find services -mindepth 2 -maxdepth 2 -name Dockerfile -printf '%h\n')
           fi
 
-
           echo ""
-
           echo "========================================"
-
           echo "Changed Files"
-
           echo "========================================"
-
           echo "${CHANGED_FILES}"
 
-
-          # ---------------------------------------------------------
-          # Extract service names.
-          #
-          # Example:
-          #
-          # services/payment-service/src/App.java
-          #
-          # becomes:
-          #
-          # payment-service
-          # ---------------------------------------------------------
-
-          if [[ "${{ github.event_name }}" == \
-            "workflow_dispatch" ]]; then
-
-
-            SERVICES=$(
-
-              echo "${CHANGED_FILES}" \
-              | awk -F'/' '{print $2}' \
-              | sort -u
-
-            )
-
-
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SERVICES=$(echo "${CHANGED_FILES}" | awk -F'/' '{print $2}' | sort -u)
           else
-
-
-            SERVICES=$(
-
-              echo "${CHANGED_FILES}" \
-              | grep '^services/' \
-              | awk -F'/' '{print $2}' \
-              | sort -u \
-              || true
-
-            )
-
-
+            SERVICES=$(echo "${CHANGED_FILES}" | grep '^services/' | awk -F'/' '{print $2}' | sort -u || true)
           fi
 
-
-          # ---------------------------------------------------------
-          # SHARED COMPONENT CHANGES
-          #
-          # Changes to shared components may affect every service.
-          #
-          # Examples:
-          #
-          # root pom.xml
-          #
-          # shared/
-          #
-          # libs/
-          #
-          # docker/base/
-          #
-          # In this situation rebuild ALL services.
-          # ---------------------------------------------------------
-
-          if echo "${CHANGED_FILES}" \
-            | grep -Eq \
-            '^(pom\.xml|shared/|libs/|docker/base/)'; then
-
-
+          if echo "${CHANGED_FILES}" | grep -Eq '^(pom\.xml|shared/|libs/|docker/base/)'; then
             echo ""
-
             echo "Shared component changed."
-
             echo "All services will be rebuilt."
 
-
-            SERVICES=$(
-
-              find services \
-                -mindepth 2 \
-                -maxdepth 2 \
-                -name Dockerfile \
-                -printf '%h\n' \
-              | awk -F'/' '{print $2}' \
-              | sort -u
-
-            )
-
-
+            SERVICES=$(find services -mindepth 2 -maxdepth 2 -name Dockerfile -printf '%h\n' | awk -F'/' '{print $2}' | sort -u)
           fi
 
-
           echo ""
-
           echo "========================================"
-
           echo "Affected Services"
-
           echo "========================================"
-
           echo "${SERVICES}"
 
-
-          # ---------------------------------------------------------
-          # NO APPLICATION CHANGES
-          #
-          # Example:
-          #
-          # README.md
-          #
-          # docs/
-          #
-          # No Docker builds are required.
-          # ---------------------------------------------------------
-
           if [[ -z "${SERVICES}" ]]; then
-
-
             echo "No microservices affected."
-
-
-            echo 'matrix=[]' \
-              >> "$GITHUB_OUTPUT"
-
-
-            echo 'has-changes=false' \
-              >> "$GITHUB_OUTPUT"
-
-
+            echo 'matrix=[]' >> "$GITHUB_OUTPUT"
+            echo 'has-changes=false' >> "$GITHUB_OUTPUT"
             exit 0
-
-
           fi
 
-
-          # ---------------------------------------------------------
-          # Generate Dynamic Matrix
-          #
-          # Example:
-          #
-          # [
-          #
-          #   {
-          #
-          #     "service": "payment-service",
-          #
-          #     "dockerfile":
-          #       "services/payment-service/Dockerfile"
-          #
-          #   }
-          #
-          # ]
-          # ---------------------------------------------------------
-
           MATRIX=$(
-
             echo "${SERVICES}" \
-            | jq \
-                -R \
-                -s \
-                -c \
-                '
-
+            | jq -R -s -c '
                 split("\n")
-
-                |
-
-                map(select(length > 0))
-
-                |
-
-                map({
-
-                  service: .,
-
-                  dockerfile:
-                    ("services/" + . + "/Dockerfile")
-
-                })
-
-                '
-
+                | map(select(length > 0))
+                | map({
+                    service: .,
+                    dockerfile: ("services/" + . + "/Dockerfile")
+                  })
+              '
           )
 
-
           echo ""
-
           echo "Generated Matrix:"
-
           echo "${MATRIX}"
 
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "has-changes=true" >> "$GITHUB_OUTPUT"
 
-          echo "matrix=${MATRIX}" \
-            >> "$GITHUB_OUTPUT"
-
-
-          echo "has-changes=true" \
-            >> "$GITHUB_OUTPUT"
-
-
-
- 
-  # =================================================================
-  # JOB 3
-  #
-  # PR / MANUAL VALIDATION
-  #
-  # This job builds and scans changed services but does NOT:
-  #
-  #   authenticate to AWS
-  #
-  #   push to ECR
-  #
-  #   sign images
-  #
-  #   generate deployment metadata
-  #
-  # NOTE:
-  #
-  # This requires reusable-build.yml to ensure AWS/ECR/publish steps
-  # are guarded by:
-  #
-  #   if: inputs.push-image
-  #
-  # =================================================================
 
   validate-services:
     name: Validate ${{ matrix.service }}
-
     needs:
       - detect-changes
     if: |
       github.event_name != 'push' &&
       needs.detect-changes.outputs.has-changes == 'true'
-
     strategy:
       fail-fast: false
       max-parallel: 5
       matrix:
         include: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
-
     uses: ./.github/workflows/reusable-build.yml
-
     with:
       service-name: ${{ matrix.service }}
       dockerfile: ${{ matrix.dockerfile }}
       java-version: "21"
-
-      # Validation is intentionally environment-independent.
-      #
-      # IMPORTANT:
-      # Do NOT pass an "environment" input here.
-      #
-      # reusable-build.yml does not define an environment input, and CI
-      # validation should validate the application artifact rather than
-      # couple the build to a deployment environment.
-      #
-      # aws-region and ecr-repository remain part of the reusable workflow
-      # contract. They are not used for AWS publishing while push-image=false.
-
       aws-region: "ap-south-1"
       ecr-repository: ${{ matrix.service }}
       push-image: false
-    # --------------------------------------------------------------
-    # EXPLICIT SECRET PASSING
-    #
-    # Avoid `secrets: inherit`. Only secrets declared by the reusable
-    # workflow contract are passed to this job.
-    #
-    # This prevents future repository/environment secrets from becoming
-    # available to the reusable workflow merely because they were added
-    # to the repository.
-    # --------------------------------------------------------------
-
     secrets:
       AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
       SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
 
-
-  # =================================================================
-  # JOB 4
-  #
-  # BUILD + PUBLISH SERVICES
-  #
-  # Runs only after a PUSH to:
-  #
-  # dev
-  #
-  # staging
-  #
-  # main
-  #
-  # Each changed service is built independently using a matrix.
-  #
-  # Each successful service build produces:
-  #
-  # deployment-metadata-<service>
-  #
-  # =================================================================
-
-  # =================================================================
-  # BUILD RELEASE CANDIDATE
-  #
-  # Runs ONLY when code reaches the DEV branch.
-  #
-  # This is the only place where application container images
-  # are created as deployable artifacts.
-  #
-  # Images are published to the Central Artifact ECR.
-  # =================================================================
-
   build-services:
-
     name: Build Release ${{ matrix.service }}
-
     needs:
-
       - detect-changes
-
-
     if: |
       github.event_name == 'push' &&
       github.ref_name == 'dev' &&
       needs.detect-changes.outputs.has-changes == 'true'
-
-
-    # =============================================================
-    # LEAST-PRIVILEGE OIDC PERMISSIONS
-    #
-    # This job calls reusable-build.yml with push-image=true.
-    #
-    # The called workflow needs an OIDC token for:
-    #
-    #   1. AWS federation via configure-aws-credentials
-    #   2. Cosign keyless signing
-    #   3. GitHub build-provenance attestation
-    #
-    # Reusable workflows cannot elevate token permissions beyond
-    # those granted by their caller. Therefore id-token: write must
-    # be granted on this caller job.
-    #
-    # We intentionally grant it here rather than globally so that
-    # PR validation and other CI jobs remain read-only.
-    # =============================================================
-
     permissions:
       contents: read
       id-token: write
       attestations: write
-
-
     strategy:
-
       fail-fast: false
       max-parallel: 5
       matrix:
         include: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
-
     uses: ./.github/workflows/reusable-build.yml
     with:
       service-name: ${{ matrix.service }}
@@ -771,126 +180,47 @@ jobs:
       aws-region: "ap-south-1"
       ecr-repository: ${{ matrix.service }}
       push-image: true
-
-    # --------------------------------------------------------------
-    # EXPLICIT SECRET PASSING
-    #
-    # Avoid `secrets: inherit`. Only secrets declared by the reusable
-    # workflow contract are passed to this job.
-    #
-    # This prevents future repository/environment secrets from becoming
-    # available to the reusable workflow merely because they were added
-    # to the repository.
-    # --------------------------------------------------------------
-
     secrets:
       AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
       SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
 
-
-  # =================================================================
-  # JOB 5
-  #
-  # CREATE DEPLOYMENT MANIFEST
-  #
-  # Each service build produced:
-  #
-  # payment-service.json
-  #
-  # order-service.json
-  #
-  # user-service.json
-  #
-  # This job aggregates them into:
-  #
-  # deployment-manifest.json
-  #
-  # This becomes the CI → CD contract.
-  # =================================================================
-
   create-deployment-manifest:
-
     name: Create Deployment Manifest
-
-
     needs:
-
       - detect-changes
-
       - build-services
-
-
     if: |
       github.event_name == 'push' &&
       github.ref_name == 'dev' &&
       needs.detect-changes.outputs.has-changes == 'true' &&
       needs.build-services.result == 'success'
-
-
     runs-on: ubuntu-latest
-
-
     steps:
-
-
-      # =============================================================
-      # Download all metadata artifacts produced by matrix builds.
-      # =============================================================
-
       - name: Download Service Metadata
-
         uses: actions/download-artifact@v4
-
         with:
-
           pattern: deployment-metadata-*
-
           path: deployment-metadata
-
           merge-multiple: true
-
-      # =============================================================
-      # Verify Metadata Exists
-      # =============================================================
 
       - name: Verify Metadata
         shell: bash
         run: |
-
           set -euo pipefail
           echo "Deployment metadata files:"
-          find deployment-metadata \
-            -type f \
-            -name "*.json" \
-            -print
+          find deployment-metadata -type f -name "*.json" -print
 
-          METADATA_COUNT=$(
-
-            find deployment-metadata \
-              -type f \
-              -name "*.json" \
-            | wc -l
-
-          )
-
+          METADATA_COUNT=$(find deployment-metadata -type f -name "*.json" | wc -l)
           echo "Metadata count: ${METADATA_COUNT}"
 
           if [[ "${METADATA_COUNT}" -eq 0 ]]; then
-
-            echo "ERROR:"
-            echo "No deployment metadata generated."
+            echo "ERROR: No deployment metadata generated."
             exit 1
-
           fi
 
-      # =============================================================
-      # Generate Deployment Manifest
-      # =============================================================
-
       - name: Generate Deployment Manifest
-
         env:
           RELEASE_ID: ${{ github.sha }}
           COMMIT_SHA: ${{ github.sha }}
@@ -899,29 +229,14 @@ jobs:
           SOURCE_BRANCH: ${{ github.ref_name }}
           SOURCE_REPOSITORY: ${{ github.repository }}
           WORKFLOW_NAME: ${{ github.workflow }}
-
         shell: bash
-
         run: |
-
           set -euo pipefail
 
-          # Aggregate service metadata.
-          jq \
-            -s \
-            '.' \
-            deployment-metadata/*.json \
-            > images.json
+          jq -s '.' deployment-metadata/*.json > images.json
+          jq 'sort_by(.service)' images.json > sorted-images.json
 
-          # Deterministic ordering.
-          jq \
-            'sort_by(.service)' \
-            images.json \
-            > sorted-images.json
-
-          # Create authoritative CI -> CD release contract.
-          jq \
-            -n \
+          jq -n \
             --arg schemaVersion "1.1" \
             --arg releaseId "${RELEASE_ID}" \
             --arg repository "${SOURCE_REPOSITORY}" \
@@ -931,201 +246,79 @@ jobs:
             --arg runId "${RUN_ID}" \
             --arg runAttempt "${RUN_ATTEMPT}" \
             --slurpfile images sorted-images.json \
-            '
-            {
+            '{
               schemaVersion: $schemaVersion,
-
               releaseId: $releaseId,
-
               source: {
                 repository: $repository,
                 branch: $branch,
                 commit: $commit
               },
-
               ci: {
                 workflow: $workflow,
                 runId: $runId,
                 runAttempt: $runAttempt
               },
-
               images: $images[0]
-            }
-            ' \
+            }' \
             > deployment-manifest.json
 
           echo "Deployment Manifest:"
           jq '.' deployment-manifest.json
 
-                
-            # =============================================================
-            # Validate Deployment Manifest
-            #
-            # Fail closed if required artifact metadata is missing.
-            # =============================================================
       - name: Validate Deployment Manifest
-
         shell: bash
-
         run: |
-
           set -euo pipefail
 
-          jq \
-            -e \
-            '
+          jq -e '
             .schemaVersion == "1.1"
-            and
-            (.releaseId | type == "string" and length == 40)
-            and
-            (.source.repository | type == "string" and length > 0)
-            and
-            (.source.branch == "dev")
-            and
-            (.source.commit == .releaseId)
-            and
-            (.ci.workflow | type == "string" and length > 0)
-            and
-            (.ci.runId | type == "string" and length > 0)
-            and
-            (.ci.runAttempt | type == "string" and length > 0)
-            and
-            (.images | type == "array" and length > 0)
-            and
-            (
+            and (.releaseId | type == "string" and length == 40)
+            and (.source.repository | type == "string" and length > 0)
+            and (.source.branch == "dev")
+            and (.source.commit == .releaseId)
+            and (.ci.workflow | type == "string" and length > 0)
+            and (.ci.runId | type == "string" and length > 0)
+            and (.ci.runAttempt | type == "string" and length > 0)
+            and (.images | type == "array" and length > 0)
+            and (
               all(
                 .images[];
                 (.service | type == "string" and length > 0)
-                and
-                (.repository | type == "string" and length > 0)
-                and
-                (.tag | type == "string" and length > 0)
-                and
-                (.digest | type == "string" and startswith("sha256:"))
+                and (.repository | type == "string" and length > 0)
+                and (.tag | type == "string" and length > 0)
+                and (.digest | type == "string" and startswith("sha256:"))
               )
             )
-            ' \
-            deployment-manifest.json
+          ' deployment-manifest.json
 
           echo "Deployment manifest validation successful."
 
-           
+      - name: Upload Deployment Manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-manifest
+          path: deployment-manifest.json
+          retention-days: 30
+          if-no-files-found: error
 
-            # =============================================================
-            # Upload CI → CD Deployment Contract
-            #
-            # deploy-dev.yml downloads this exact artifact using the
-            # originating CI workflow run ID.
-            # =============================================================
-
-            - name: Upload Deployment Manifest
-              uses: actions/upload-artifact@v4
-              with:
-                name: deployment-manifest
-                path: deployment-manifest.json
-                retention-days: 30
-                if-no-files-found: error
-
-            # =============================================================
-            # CI Summary
-            # =============================================================
-
-            - name: Write CI Summary
-
-              shell: bash
-
-              run: |
-
-                {
-                  echo "## Deployment Manifest"
-                  echo ""
-                  echo "**Commit:** \`${{ github.sha }}\`"
-                  echo ""
-                  echo "**Branch:** \`${{ github.ref_name }}\`"
-                  echo ""
-                  echo "**CI Run:** \`${{ github.run_id }}\`"
-                  echo ""
-                  echo "### Images"
-                  echo ""
-                  jq \
-                    -r \
-                    '
-                    .images[]
-                    |
-                    "- **\(.service)** → `\(.repository)@\(.digest)`"
-                    ' \
-                    deployment-manifest.json
-                } >> "$GITHUB_STEP_SUMMARY"
-
-
-
-        # =================================================================
-        # JOB 6
-        #
-        # FINAL CI STATUS GATE
-        #
-        # Configure this job as a required status check for:
-        #
-        # dev
-        #
-        # staging
-        #
-        # main
-        #
-        # This gives branch protection one deterministic CI status,
-        # regardless of how many matrix jobs were created.
-        # =================================================================
-
-  ci-status:
       - name: Write CI Summary
-
         shell: bash
-
         run: |
-
           {
-            echo "## Release Created"
+            echo "## Deployment Manifest"
             echo ""
-            echo "**Release ID:** \`${{ github.sha }}\`"
+            echo "**Commit:** \`${{ github.sha }}\`"
             echo ""
-            echo "**Source Commit:** \`${{ github.sha }}\`"
-            echo ""
-            echo "**Source Branch:** \`${{ github.ref_name }}\`"
-            echo ""
-            echo "**Repository:** \`${{ github.repository }}\`"
+            echo "**Branch:** \`${{ github.ref_name }}\`"
             echo ""
             echo "**CI Run:** \`${{ github.run_id }}\`"
             echo ""
-            echo "**CI Attempt:** \`${{ github.run_attempt }}\`"
+            echo "### Images"
             echo ""
-            echo "### Immutable Images"
-            echo ""
-
-            jq \
-              -r \
-              '
-              .images[]
-              |
-              "- **\(.service)** → `\(.repository)@\(.digest)`"
-              ' \
-              deployment-manifest.json
-
+            jq -r '.images[] | "- **\(.service)** → `\(.repository)@\(.digest)`"' deployment-manifest.json
           } >> "$GITHUB_STEP_SUMMARY"
 
-          
-
-# ==================================================================
-# CREATE RELEASE RECORD
-#
-# Add this job AFTER the job that aggregates deployment-manifest.json.
-#
-# Example dependency:
-#
-#   needs:
-#     - create-deployment-manifest
-#
-# Adjust the job name below to match your actual ci.yml.
-# ==================================================================
 
   register-release:
     name: Register Release
@@ -1137,21 +330,11 @@ jobs:
       needs.create-deployment-manifest.result == 'success'
     runs-on: ubuntu-latest
     steps:
-
-      # =============================================================
-      # Download Deployment Manifest
-      # =============================================================
       - name: Download Deployment Manifest
         uses: actions/download-artifact@v4
         with:
           name: deployment-manifest
           path: deployment
-
-
-
-      # =============================================================
-      # Checkout GitOps Repository
-      # =============================================================
 
       - name: Checkout GitOps Repository
         uses: actions/checkout@v4
@@ -1161,25 +344,13 @@ jobs:
           ref: main
           path: gitops
           fetch-depth: 0
-      # =============================================================
-      # Create Release Registry Entry
-      #
-      # The FULL Git SHA is used as release ID.
-      # =============================================================
 
       - name: Create Release Record
-
         shell: bash
-
         run: |
-
           set -euo pipefail
 
           MANIFEST="deployment/deployment-manifest.json"
-
-          # ---------------------------------------------------------
-          # Read authoritative release identity from CI contract.
-          # ---------------------------------------------------------
 
           RELEASE_ID=$(jq -r '.releaseId' "${MANIFEST}")
           SOURCE_REPOSITORY=$(jq -r '.source.repository' "${MANIFEST}")
@@ -1195,44 +366,23 @@ jobs:
 
           mkdir -p "${RELEASE_DIR}"
 
-          # ---------------------------------------------------------
-          # Release identity must never be overwritten.
-          # ---------------------------------------------------------
-
           if [[ -f "${RELEASE_FILE}" ]]; then
-
             echo "ERROR: Release record already exists."
             echo "Release: ${RELEASE_ID}"
-
             exit 1
-
           fi
 
-          # ---------------------------------------------------------
-          # Defense-in-depth contract validation.
-          # ---------------------------------------------------------
-
           if [[ "${RELEASE_ID}" != "${SOURCE_COMMIT}" ]]; then
-
             echo "ERROR: Release ID does not match source commit."
-
             exit 1
-
           fi
 
           if [[ "${SOURCE_BRANCH}" != "dev" ]]; then
-
             echo "ERROR: Releases may only originate from dev."
-
             exit 1
-
           fi
 
           CREATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-          # ---------------------------------------------------------
-          # Create release record.
-          # ---------------------------------------------------------
 
           cat > "${RELEASE_FILE}" <<EOF
           schemaVersion: "1.1"
@@ -1267,12 +417,7 @@ jobs:
           images:
           EOF
 
-          # ---------------------------------------------------------
-          # Add immutable image identities.
-          # ---------------------------------------------------------
-
           while IFS= read -r item; do
-
             SERVICE=$(echo "${item}" | jq -r '.service')
             REPOSITORY=$(echo "${item}" | jq -r '.repository')
             TAG=$(echo "${item}" | jq -r '.tag')
@@ -1285,56 +430,90 @@ jobs:
               tag: "${TAG}"
               digest: "${DIGEST}"
           EOF
-
-          done < <(
-            jq \
-              -c \
-              '.images[]' \
-              "${MANIFEST}"
-          )
+          done < <(jq -c '.images[]' "${MANIFEST}")
 
           echo ""
           echo "Created release record:"
           echo ""
-
           cat "${RELEASE_FILE}"
 
-      # =============================================================
-      # Commit Release Record
-      # =============================================================
-      - name: Commit Release Record
-
-        working-directory: gitops
-
+      - name: Write CI Summary
         shell: bash
-
         run: |
+          {
+            echo "## Release Created"
+            echo ""
+            echo "**Release ID:** \`${{ github.sha }}\`"
+            echo ""
+            echo "**Source Commit:** \`${{ github.sha }}\`"
+            echo ""
+            echo "**Source Branch:** \`${{ github.ref_name }}\`"
+            echo ""
+            echo "**Repository:** \`${{ github.repository }}\`"
+            echo ""
+            echo "**CI Run:** \`${{ github.run_id }}\`"
+            echo ""
+            echo "**CI Attempt:** \`${{ github.run_attempt }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Commit Release Record
+        working-directory: gitops
+        shell: bash
+        run: |
           set -euo pipefail
 
-          RELEASE_ID=$(jq -r \
-            '.releaseId' \
-            ../deployment/deployment-manifest.json)
+          RELEASE_ID=$(jq -r '.releaseId' ../deployment/deployment-manifest.json)
 
-          git config \
-            user.name \
-            "github-actions[bot]"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git config \
-            user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "releases/${RELEASE_ID}/release.yaml"
+          git commit -m "release: register ${RELEASE_ID}"
+          git pull --rebase origin main
+          git push origin HEAD:main
 
-          git add \
-            "releases/${RELEASE_ID}/release.yaml"
 
-          git commit \
-            -m "release: register ${RELEASE_ID}"
+  ci-status:
+    name: CI Status Gate
+    needs:
+      - detect-changes
+      - validate-services
+      - build-services
+      - create-deployment-manifest
+      - register-release
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Required Jobs
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          git pull \
-            --rebase \
-            origin \
-            main
+          declare -A RESULTS=(
+            ["detect-changes"]="${{ needs.detect-changes.result }}"
+            ["validate-services"]="${{ needs.validate-services.result }}"
+            ["build-services"]="${{ needs.build-services.result }}"
+            ["create-deployment-manifest"]="${{ needs.create-deployment-manifest.result }}"
+            ["register-release"]="${{ needs.register-release.result }}"
+          )
 
-          git push \
-            origin \
-            HEAD:main
+          FAILED=false
+
+          for job in "${!RESULTS[@]}"; do
+            result="${RESULTS[$job]}"
+            echo "${job}: ${result}"
+
+            if [[ "${result}" == "failure" || "${result}" == "cancelled" ]]; then
+              echo "  -> Required job failed or was cancelled."
+              FAILED=true
+            fi
+          done
+
+          if [[ "${FAILED}" == "true" ]]; then
+            echo ""
+            echo "CI Status Gate: FAILED"
+            exit 1
+          fi
+
+          echo ""
+          echo "CI Status Gate: PASSED"
