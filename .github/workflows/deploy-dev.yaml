@@ -1016,15 +1016,17 @@ jobs:
 
             fi
 
-            ECR_REPOSITORY="${REPOSITORY#*/}"
+            ECR_REPOSITORY="${REPOSITORY}"
 
-            if [[ -z "${ECR_REPOSITORY}" ]]; then
+            # ECR_REPOSITORY="${REPOSITORY#*/}"
 
-              echo "ERROR: Unable to determine ECR repository for ${SERVICE}."
+            # if [[ -z "${ECR_REPOSITORY}" ]]; then
 
-              exit 1
+            #   echo "ERROR: Unable to determine ECR repository for ${SERVICE}."
 
-            fi
+            #   exit 1
+
+            # fi
 
             echo ""
 
