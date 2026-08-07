@@ -669,8 +669,6 @@ jobs:
 
       REGISTRY_COMMIT: ${{ needs.resolve-release.outputs.release-registry-commit }}
 
-      RELEASE_REGISTRY_PATH: ${{ env.RELEASE_REGISTRY_PATH }}
-
     outputs:
 
       release-id: ${{ steps.verify.outputs.release-id }}
@@ -1195,8 +1193,6 @@ jobs:
       RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
 
       REGISTRY_COMMIT: ${{ needs.resolve-release.outputs.release-registry-commit }}
-
-      RELEASE_REGISTRY_PATH: ${{ env.RELEASE_REGISTRY_PATH }}
 
       GITOPS_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
 
@@ -1866,8 +1862,6 @@ jobs:
       SERVICES_UPDATED: ${{ needs.update-dev-gitops.outputs.services-updated }}
 
       GITOPS_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
-
-      RELEASE_REGISTRY_PATH: ${{ env.RELEASE_REGISTRY_PATH }}
 
     outputs:
 
@@ -2588,8 +2582,6 @@ jobs:
 
       GITOPS_COMMIT: ${{ needs.update-dev-gitops.outputs.gitops-commit }}
 
-      RELEASE_REGISTRY_PATH: ${{ env.RELEASE_REGISTRY_PATH }}
-
       ARGOCD_SERVER: ${{ vars.ARGOCD_SERVER }}
 
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
@@ -2974,8 +2966,6 @@ jobs:
       APPLICATIONS_VERIFIED: ${{ needs.verify-dev-deployment.outputs.applications-verified }}
 
       SMOKE_TEST_STATUS: ${{ needs.verify-dev-deployment.outputs.smoke-test-status }}
-
-      RELEASE_REGISTRY_PATH: ${{ env.RELEASE_REGISTRY_PATH }}
 
     outputs:
 
