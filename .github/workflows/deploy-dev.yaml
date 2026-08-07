@@ -203,3 +203,127 @@ jobs:
           echo "Desired Release Updated"
 
           cat "$FILE"
+
+
+            ####################################################################
+        # Validate Deployment Manifest
+        ####################################################################
+      - name: Validate Deployment Manifest
+        run: |
+            set -euo pipefail
+
+            FILE="deployment-manifest/deployment-manifest.json"
+
+            jq empty "$FILE"
+
+            jq -e '.release' "$FILE" >/dev/null
+            jq -e '.services' "$FILE" >/dev/null
+
+            COUNT=$(jq '.services | length' "$FILE")
+
+            if [[ "$COUNT" -eq 0 ]]; then
+            echo "Deployment manifest contains no services."
+            exit 1
+            fi
+
+            echo "Found $COUNT service(s)."
+
+        ####################################################################
+        # Validate GitOps Structure
+        ####################################################################
+      - name: Validate GitOps Structure
+        run: |
+            set -euo pipefail
+
+            FILE="deployment-manifest/deployment-manifest.json"
+
+            jq -c '.services[]' "$FILE" | while read SERVICE; do
+
+            NAME=$(echo "$SERVICE" | jq -r '.service')
+
+            VALUES_FILE="gitops/applications/${NAME}/environments/dev/values.yaml"
+
+            if [[ ! -f "$VALUES_FILE" ]]; then
+                echo "Missing GitOps configuration:"
+                echo "$VALUES_FILE"
+                exit 1
+            fi
+
+            echo "Validated ${NAME}"
+
+            done
+
+        ####################################################################
+        # Update GitOps Manifests
+        ####################################################################
+      - name: Update GitOps Manifests
+        run: |
+            set -euo pipefail
+
+            FILE="deployment-manifest/deployment-manifest.json"
+
+            jq -c '.services[]' "$FILE" | while read SERVICE; do
+
+            NAME=$(echo "$SERVICE" | jq -r '.service')
+            REPOSITORY=$(echo "$SERVICE" | jq -r '.repository')
+            TAG=$(echo "$SERVICE" | jq -r '.tag')
+            DIGEST=$(echo "$SERVICE" | jq -r '.digest')
+
+            VALUES_FILE="gitops/applications/${NAME}/environments/dev/values.yaml"
+
+            echo "Updating ${NAME}"
+
+            yq -i "
+                .image.repository = \"${REPOSITORY}\" |
+                .image.tag = \"${TAG}\" |
+                .image.digest = \"${DIGEST}\"
+            " "$VALUES_FILE"
+
+            done
+
+        ####################################################################
+        # Create Release History
+        ####################################################################
+      - name: Create Release History
+        run: |
+            set -euo pipefail
+
+            RELEASE="${{ steps.release.outputs.RELEASE_SHA }}"
+
+            RELEASE_DIR="gitops/${RELEASES_PATH}/${RELEASE}"
+
+            mkdir -p "$RELEASE_DIR"
+
+            cp deployment-manifest/deployment-manifest.json \
+            "$RELEASE_DIR/deployment-manifest.json"
+
+            cat > "$RELEASE_DIR/release.yaml" <<EOF
+        release: ${RELEASE}
+        environment: ${ENVIRONMENT}
+        createdBy: github-actions
+        workflowRun: ${GITHUB_RUN_ID}
+        createdAt: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        EOF
+
+        ####################################################################
+        # Commit GitOps Changes
+        ####################################################################
+      - name: Commit GitOps Changes
+        run: |
+            set -euo pipefail
+
+            cd gitops
+
+            git config user.name "github-actions"
+            git config user.email "github-actions@github.com"
+
+            git add .
+
+            if git diff --cached --quiet; then
+            echo "No changes detected."
+            exit 0
+            fi
+
+            git commit -m "Deploy release ${{ steps.release.outputs.RELEASE_SHA }} to ${ENVIRONMENT}"
+
+            git push origin HEAD
