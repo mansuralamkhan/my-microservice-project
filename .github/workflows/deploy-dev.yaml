@@ -1055,8 +1055,12 @@ jobs:
             fi
 
             echo "ECR digest verified."
+            AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+            --query Account \
+            --output text)
+            ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-            IMAGE_REFERENCE="${REPOSITORY}@${DIGEST}"
+            IMAGE_REFERENCE="${ECR_REPOSITORY}/${REPOSITORY}@${DIGEST}"
 
             echo ""
 
