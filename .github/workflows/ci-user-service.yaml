@@ -179,7 +179,7 @@ jobs:
       service-name: ${{ matrix.service }}
       dockerfile: ${{ matrix.dockerfile }}
       java-version: "21"
-      aws-region: "ap-south-1"
+      aws-region: "us-east-1"
       ecr-repository: ${{ matrix.service }}
       push-image: true
     secrets:
