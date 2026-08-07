@@ -661,9 +661,9 @@ jobs:
 
     env:
 
-      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_REGION: us-east-1
 
-      AWS_ROLE_ARN: ${{ vars.WS_ROLE_ARN }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
 
       RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
 
