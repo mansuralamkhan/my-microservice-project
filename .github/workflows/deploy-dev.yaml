@@ -1,342 +1,3458 @@
-name: Deploy to Development
+name: Dev Release Promotion
 
 on:
 
-  # Automatic deployment after CI succeeds
   workflow_run:
+
     workflows:
       - CI Pipeline
+
     types:
       - completed
 
-  # Manual deployment
-  workflow_dispatch:
-
-    inputs:
-
-      release_sha:
-        description: "Release SHA to deploy (optional)"
-        required: false
-        type: string
-
-      simulate_result:
-        description: "Deployment result"
-
-        required: true
-
-        default: success
-
-        type: choice
-
-        options:
-          - success
-          - partial_failure
-          - failure
-
 permissions:
 
-  contents: write
-
-  actions: read
+  contents: read
 
   id-token: write
 
+  actions: read
+
 concurrency:
 
-  group: deploy-development
+  group: dev-release-promotion
 
   cancel-in-progress: false
 
 env:
 
-  ENVIRONMENT: development
+  RELEASE_REGISTRY_PATH: releases
 
-  GITOPS_REPOSITORY: mansuralamkhan/gitops-infrastructure-microservice
-
-  RELEASES_PATH: releases
-
-  ENVIRONMENT_FILE: environments/development.yaml
-
-  HISTORY_PATH: deployment-history/development
-
+  RELEASE_SCHEMA_VERSION: "1.1"
 
 jobs:
-  deploy:
-    name: Deploy Development
+
+  resolve-release:
+
+    name: Resolve Registered Release
+
     runs-on: ubuntu-latest
 
-    permissions:
-      contents: read
-      actions: read
+    timeout-minutes: 10
 
-    defaults:
-      run:
-        shell: bash
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'dev'
 
-    env:
-      GITOPS_REPOSITORY: mansuralamkhan/gitops-infrastructure-microservice
-      ENVIRONMENT_FILE: environments/development.yaml
+    outputs:
+
+      release-id: ${{ steps.resolve.outputs.release-id }}
+
+      source-commit: ${{ steps.resolve.outputs.source-commit }}
+
+      source-branch: ${{ steps.resolve.outputs.source-branch }}
+
+      ci-run-id: ${{ steps.resolve.outputs.ci-run-id }}
+
+      release-registry-commit: ${{ steps.resolve.outputs.release-registry-commit }}
 
     steps:
-      ####################################################################
-      # Checkout Application Repository
-      ####################################################################
-      - name: Checkout Application Repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      ####################################################################
-      # Resolve Release SHA
-      ####################################################################
-      - name: Resolve Release
-        id: release
+      - name: Validate CI Trigger
+
+        env:
+
+          CI_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+
+          CI_EVENT: ${{ github.event.workflow_run.event }}
+
+          CI_BRANCH: ${{ github.event.workflow_run.head_branch }}
+
+          CI_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+
+          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+
+          CI_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+
+        shell: bash
+
         run: |
+
           set -euo pipefail
 
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "=========================================="
+          echo "Validating CI trigger"
+          echo "=========================================="
 
-            RELEASE_SHA="${{ inputs.release_sha }}"
+          echo "Conclusion : ${CI_CONCLUSION}"
+          echo "Event      : ${CI_EVENT}"
+          echo "Branch     : ${CI_BRANCH}"
+          echo "Commit     : ${CI_HEAD_SHA}"
+          echo "CI Run ID  : ${CI_RUN_ID}"
+          echo "Repository : ${CI_REPOSITORY}"
 
-            if [[ -z "${RELEASE_SHA}" ]]; then
-              echo "Release SHA is required."
+          echo ""
+
+          if [[ "${CI_CONCLUSION}" != "success" ]]; then
+
+            echo "ERROR: CI execution was not successful."
+
+            exit 1
+
+          fi
+
+          if [[ "${CI_EVENT}" != "push" ]]; then
+
+            echo "ERROR: Dev release promotion requires a CI push event."
+
+            exit 1
+
+          fi
+
+          if [[ "${CI_BRANCH}" != "dev" ]]; then
+
+            echo "ERROR: Dev release promotion requires branch 'dev'."
+
+            exit 1
+
+          fi
+
+          if [[ ! "${CI_HEAD_SHA}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+
+            echo "ERROR: Invalid CI head SHA."
+
+            exit 1
+
+          fi
+
+          if [[ ! "${CI_RUN_ID}" =~ ^[0-9]+$ ]]; then
+
+            echo "ERROR: Invalid CI run ID."
+
+            exit 1
+
+          fi
+
+          if [[ -z "${CI_REPOSITORY}" ]]; then
+
+            echo "ERROR: CI source repository is missing."
+
+            exit 1
+
+          fi
+
+          echo ""
+          echo "CI trigger validation successful."
+
+      - name: Validate Release Registry Configuration
+
+        env:
+
+          GITOPS_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
+
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          if [[ -z "${GITOPS_REPOSITORY}" ]]; then
+
+            echo "ERROR: Repository variable GITOPS_REPOSITORY is not configured."
+
+            exit 1
+
+          fi
+
+          if [[ ! "${GITOPS_REPOSITORY}" =~ ^[^/]+/[^/]+$ ]]; then
+
+            echo "ERROR: GITOPS_REPOSITORY must use owner/repository format."
+
+            exit 1
+
+          fi
+
+          if [[ -z "${GITOPS_TOKEN}" ]]; then
+
+            echo "ERROR: Secret GITOPS_TOKEN is not configured."
+
+            exit 1
+
+          fi
+
+          echo "Release Registry configuration validation successful."
+
+      - name: Checkout Release Registry
+
+        uses: actions/checkout@v4
+
+        with:
+
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+          ref: main
+
+          path: release-registry
+
+          fetch-depth: 1
+
+          persist-credentials: false
+
+      - name: Install yq
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          YQ_VERSION="v4.44.3"
+
+          sudo wget \
+            --quiet \
+            --output-document=/usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+
+          sudo chmod +x /usr/local/bin/yq
+
+          echo "Installed yq:"
+
+          yq --version
+
+      - name: Resolve Registered Release
+
+        id: resolve
+
+        env:
+
+          RELEASE_LOOKUP_KEY: ${{ github.event.workflow_run.head_sha }}
+
+          RELEASE_REGISTRY_PATH: ${{ env.RELEASE_REGISTRY_PATH }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="${RELEASE_REGISTRY_PATH}/${RELEASE_LOOKUP_KEY}/release.yaml"
+
+          FULL_RELEASE_FILE="release-registry/${RELEASE_FILE}"
+
+          echo "=========================================="
+          echo "Resolving registered release"
+          echo "=========================================="
+
+          echo "Lookup key   : ${RELEASE_LOOKUP_KEY}"
+          echo "Registry file: ${RELEASE_FILE}"
+
+          echo ""
+
+          if [[ ! -f "${FULL_RELEASE_FILE}" ]]; then
+
+            echo "ERROR: Registered release does not exist."
+
+            echo ""
+
+            echo "Expected release record:"
+
+            echo "${FULL_RELEASE_FILE}"
+
+            exit 1
+
+          fi
+
+          if [[ ! -s "${FULL_RELEASE_FILE}" ]]; then
+
+            echo "ERROR: Release record is empty."
+
+            exit 1
+
+          fi
+
+          RELEASE_ID=$(
+
+            yq -r \
+              '.release.id' \
+              "${FULL_RELEASE_FILE}"
+
+          )
+
+          SOURCE_COMMIT=$(
+
+            yq -r \
+              '.source.commit' \
+              "${FULL_RELEASE_FILE}"
+
+          )
+
+          SOURCE_BRANCH=$(
+
+            yq -r \
+              '.source.branch' \
+              "${FULL_RELEASE_FILE}"
+
+          )
+
+          CI_RUN_ID=$(
+
+            yq -r \
+              '.ci.runId' \
+              "${FULL_RELEASE_FILE}"
+
+          )
+
+          RELEASE_REGISTRY_COMMIT=$(
+
+            git \
+              -C release-registry \
+              rev-parse HEAD
+
+          )
+
+          for VALUE_NAME in \
+            RELEASE_ID \
+            SOURCE_COMMIT \
+            SOURCE_BRANCH \
+            CI_RUN_ID \
+            RELEASE_REGISTRY_COMMIT
+
+          do
+
+            VALUE="${!VALUE_NAME}"
+
+            if [[ -z "${VALUE}" || "${VALUE}" == "null" ]]; then
+
+              echo "ERROR: Required release field ${VALUE_NAME} is missing."
+
+              exit 1
+
+            fi
+
+          done
+
+          {
+
+            echo "release-id=${RELEASE_ID}"
+
+            echo "source-commit=${SOURCE_COMMIT}"
+
+            echo "source-branch=${SOURCE_BRANCH}"
+
+            echo "ci-run-id=${CI_RUN_ID}"
+
+            echo "release-registry-commit=${RELEASE_REGISTRY_COMMIT}"
+
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Release resolved successfully."
+
+          echo ""
+
+          echo "Release ID              : ${RELEASE_ID}"
+
+          echo "Source Commit           : ${SOURCE_COMMIT}"
+
+          echo "Source Branch           : ${SOURCE_BRANCH}"
+
+          echo "CI Run ID               : ${CI_RUN_ID}"
+
+          echo "Release Registry Commit : ${RELEASE_REGISTRY_COMMIT}"
+
+      - name: Validate Registered Release
+
+        env:
+
+          RELEASE_ID: ${{ steps.resolve.outputs.release-id }}
+
+          SOURCE_COMMIT: ${{ steps.resolve.outputs.source-commit }}
+
+          SOURCE_BRANCH: ${{ steps.resolve.outputs.source-branch }}
+
+          REGISTERED_CI_RUN_ID: ${{ steps.resolve.outputs.ci-run-id }}
+
+          EXPECTED_SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha }}
+
+          EXPECTED_CI_RUN_ID: ${{ github.event.workflow_run.id }}
+
+          EXPECTED_SOURCE_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+
+          EXPECTED_SCHEMA_VERSION: ${{ env.RELEASE_SCHEMA_VERSION }}
+
+          RELEASE_REGISTRY_PATH: ${{ env.RELEASE_REGISTRY_PATH }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="release-registry/${RELEASE_REGISTRY_PATH}/${EXPECTED_SOURCE_COMMIT}/release.yaml"
+
+          echo "=========================================="
+          echo "Validating registered release"
+          echo "=========================================="
+
+          SCHEMA_VERSION=$(
+
+            yq -r \
+              '.schemaVersion' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ "${SCHEMA_VERSION}" != "${EXPECTED_SCHEMA_VERSION}" ]]; then
+
+            echo "ERROR: Unsupported release schema."
+
+            echo "Expected: ${EXPECTED_SCHEMA_VERSION}"
+
+            echo "Actual  : ${SCHEMA_VERSION}"
+
+            exit 1
+
+          fi
+
+          if [[ "${RELEASE_ID}" != "${EXPECTED_SOURCE_COMMIT}" ]]; then
+
+            echo "ERROR: Release ID does not match originating CI commit."
+
+            exit 1
+
+          fi
+
+          if [[ "${SOURCE_COMMIT}" != "${EXPECTED_SOURCE_COMMIT}" ]]; then
+
+            echo "ERROR: Release source commit does not match CI commit."
+
+            exit 1
+
+          fi
+
+          if [[ "${SOURCE_BRANCH}" != "dev" ]]; then
+
+            echo "ERROR: Release did not originate from branch dev."
+
+            exit 1
+
+          fi
+
+          REGISTERED_SOURCE_REPOSITORY=$(
+
+            yq -r \
+              '.source.repository' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ "${REGISTERED_SOURCE_REPOSITORY}" != "${EXPECTED_SOURCE_REPOSITORY}" ]]; then
+
+            echo "ERROR: Release source repository mismatch."
+
+            echo "Expected: ${EXPECTED_SOURCE_REPOSITORY}"
+
+            echo "Actual  : ${REGISTERED_SOURCE_REPOSITORY}"
+
+            exit 1
+
+          fi
+
+          if [[ "${REGISTERED_CI_RUN_ID}" != "${EXPECTED_CI_RUN_ID}" ]]; then
+
+            echo "ERROR: Registered CI run does not match triggering CI run."
+
+            echo "Expected: ${EXPECTED_CI_RUN_ID}"
+
+            echo "Actual  : ${REGISTERED_CI_RUN_ID}"
+
+            exit 1
+
+          fi
+
+          CI_STATUS=$(
+
+            yq -r \
+              '.ci.status' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ "${CI_STATUS}" != "passed" ]]; then
+
+            echo "ERROR: Registered release CI status is not passed."
+
+            echo "Actual CI status: ${CI_STATUS}"
+
+            exit 1
+
+          fi
+
+          DEV_STATUS=$(
+
+            yq -r \
+              '.promotion.development.status' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ "${DEV_STATUS}" != "pending" ]]; then
+
+            echo "ERROR: Release is not eligible for initial Dev promotion."
+
+            echo "Current development status: ${DEV_STATUS}"
+
+            exit 1
+
+          fi
+
+          IMAGE_COUNT=$(
+
+            yq \
+              '.images | length' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ ! "${IMAGE_COUNT}" =~ ^[0-9]+$ ]] || \
+             (( IMAGE_COUNT < 1 )); then
+
+            echo "ERROR: Release contains no deployable images."
+
+            exit 1
+
+          fi
+
+          while IFS= read -r SERVICE
+
+          do
+
+            if [[ -z "${SERVICE}" || "${SERVICE}" == "null" ]]; then
+              echo "ERROR: Invalid service key in release registry."
               exit 1
             fi
 
-            echo "CI_RUN_ID=" >> "$GITHUB_OUTPUT"
+            REPOSITORY=$(
 
-          else
+              SERVICE="${SERVICE}" \
+              yq -r \
+                '.images[strenv(SERVICE)].repository' \
+                "${RELEASE_FILE}"
 
-            RELEASE_SHA="${{ github.event.workflow_run.head_sha }}"
-            CI_RUN_ID="${{ github.event.workflow_run.id }}"
+            )
 
-            echo "CI_RUN_ID=${CI_RUN_ID}" >> "$GITHUB_OUTPUT"
+            TAG=$(
+
+              SERVICE="${SERVICE}" \
+              yq -r \
+                '.images[strenv(SERVICE)].tag' \
+                "${RELEASE_FILE}"
+
+            )
+
+            DIGEST=$(
+
+              SERVICE="${SERVICE}" \
+              yq -r \
+                '.images[strenv(SERVICE)].digest' \
+                "${RELEASE_FILE}"
+
+            )
+
+            if [[ -z "${REPOSITORY}" || "${REPOSITORY}" == "null" ]]; then
+
+              echo "ERROR: Missing repository for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            if [[ -z "${TAG}" || "${TAG}" == "null" ]]; then
+
+              echo "ERROR: Missing tag for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+
+              echo "ERROR: Invalid image digest for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            echo "Validated release metadata for ${SERVICE}."
+
+          done < <(
+
+            yq -r \
+              '.images | keys | .[]' \
+              "${RELEASE_FILE}"
+
+          )
+
+          echo ""
+
+          echo "Registered release validation successful."
+
+      - name: Write Release Resolution Summary
+
+        env:
+
+          RELEASE_ID: ${{ steps.resolve.outputs.release-id }}
+
+          SOURCE_COMMIT: ${{ steps.resolve.outputs.source-commit }}
+
+          SOURCE_BRANCH: ${{ steps.resolve.outputs.source-branch }}
+
+          CI_RUN_ID: ${{ steps.resolve.outputs.ci-run-id }}
+
+          REGISTRY_COMMIT: ${{ steps.resolve.outputs.release-registry-commit }}
+
+        shell: bash
+
+        run: |
+
+          {
+
+            echo "## Dev Release Resolution"
+
+            echo ""
+
+            echo "| Attribute | Value |"
+
+            echo "|---|---|"
+
+            echo "| Release ID | \`${RELEASE_ID}\` |"
+
+            echo "| Source Commit | \`${SOURCE_COMMIT}\` |"
+
+            echo "| Source Branch | \`${SOURCE_BRANCH}\` |"
+
+            echo "| CI Run ID | \`${CI_RUN_ID}\` |"
+
+            echo "| Registry Commit | \`${REGISTRY_COMMIT}\` |"
+
+            echo "| Release Status | Registered / Validated |"
+
+            echo "| Dev Promotion | Eligible |"
+
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  verify-release-artifacts:
+
+    name: Verify Release Artifacts
+
+    needs:
+      - resolve-release
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 20
+
+    environment:
+      name: development
+
+    env:
+
+      AWS_REGION: ${{ vars.AWS_REGION }}
+
+      AWS_ROLE_ARN: ${{ vars.DEV_AWS_ROLE_ARN }}
+
+      RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
+
+      REGISTRY_COMMIT: ${{ needs.resolve-release.outputs.release-registry-commit }}
+
+      RELEASE_REGISTRY_PATH: ${{ env.RELEASE_REGISTRY_PATH }}
+
+    outputs:
+
+      release-id: ${{ steps.verify.outputs.release-id }}
+
+      image-count: ${{ steps.verify.outputs.image-count }}
+
+    steps:
+
+      - name: Validate Release Inputs
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "Validating release verification inputs"
+          echo "=========================================="
+
+          echo "Release ID      : ${RELEASE_ID}"
+          echo "Registry Commit : ${REGISTRY_COMMIT}"
+          echo "AWS Region      : ${AWS_REGION}"
+
+          if [[ -z "${RELEASE_ID}" ]]; then
+
+            echo "ERROR: Release ID was not provided."
+
+            exit 1
 
           fi
 
-          echo "RELEASE_SHA=${RELEASE_SHA}" >> "$GITHUB_OUTPUT"
+          if [[ -z "${REGISTRY_COMMIT}" ]]; then
 
-          echo "Deploying Release: ${RELEASE_SHA}"
+            echo "ERROR: Release Registry commit was not provided."
 
-      ####################################################################
-      # Download Deployment Contract
-      ####################################################################
-      - name: Download Deployment Contract
-        if: github.event_name == 'workflow_run'
-        uses: actions/download-artifact@v4
-        with:
-          name: deployment-manifest
-          run-id: ${{ steps.release.outputs.CI_RUN_ID }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: deployment-manifest
+            exit 1
 
-      ####################################################################
-      # Validate Deployment Contract
-      ####################################################################
-      - name: Validate Deployment Contract
-        run: |
-          set -euo pipefail
+          fi
 
-          test -f deployment-manifest/deployment-manifest.json
-        
+          if [[ ! "${REGISTRY_COMMIT}" =~ ^[0-9a-fA-F]{40}$ ]]; then
 
-          echo "Deployment contract verified."
+            echo "ERROR: Invalid Release Registry Git commit."
 
-      ####################################################################
-      # Checkout GitOps Repository
-      ####################################################################
-      - name: Checkout GitOps Repository
+            exit 1
+
+          fi
+
+          if [[ -z "${AWS_REGION}" ]]; then
+
+            echo "ERROR: AWS_REGION is not configured."
+
+            exit 1
+
+          fi
+
+          if [[ -z "${AWS_ROLE_ARN}" ]]; then
+
+            echo "ERROR: DEV_AWS_ROLE_ARN is not configured."
+
+            exit 1
+
+          fi
+
+          echo "Release verification inputs are valid."
+
+      - name: Checkout Release Registry
+
         uses: actions/checkout@v4
+
         with:
-          repository: ${{ env.GITOPS_REPOSITORY }}
+
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+
           token: ${{ secrets.GITOPS_TOKEN }}
-          path: gitops
+
+          ref: ${{ needs.resolve-release.outputs.release-registry-commit }}
+
+          path: release-registry
+
           fetch-depth: 1
 
-      ####################################################################
-      # Validate Environment File
-      ####################################################################
-      - name: Validate Environment File
+          persist-credentials: false
+
+      - name: Install yq
+
+        shell: bash
+
         run: |
+
           set -euo pipefail
 
-          FILE="gitops/${ENVIRONMENT_FILE}"
+          YQ_VERSION="v4.44.3"
 
-          if [[ ! -f "$FILE" ]]; then
-            echo "Environment file not found: $FILE"
+          sudo wget \
+            --quiet \
+            --output-document=/usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+
+          sudo chmod +x /usr/local/bin/yq
+
+          yq --version
+
+      - name: Configure AWS Credentials
+
+        uses: aws-actions/configure-aws-credentials@v4
+
+        with:
+
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+
+          aws-region: ${{ env.AWS_REGION }}
+
+          role-session-name: dev-release-${{ github.run_id }}
+
+      - name: Verify AWS Identity
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "AWS identity"
+          echo "=========================================="
+
+          aws sts get-caller-identity
+
+      - name: Install Cosign
+
+        uses: sigstore/cosign-installer@v3
+
+        with:
+
+          cosign-release: v2.4.1
+
+      - name: Verify Cosign Installation
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          cosign version
+
+      - name: Validate Release Snapshot
+
+        env:
+
+          EXPECTED_RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
+
+          EXPECTED_SOURCE_COMMIT: ${{ needs.resolve-release.outputs.source-commit }}
+
+          EXPECTED_CI_RUN_ID: ${{ needs.resolve-release.outputs.ci-run-id }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="release-registry/${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          if [[ ! -s "${RELEASE_FILE}" ]]; then
+
+            echo "ERROR: Release record does not exist in resolved Registry snapshot."
+
+            echo "Expected: ${RELEASE_FILE}"
+
+            exit 1
+
+          fi
+
+          ACTUAL_RELEASE_ID=$(
+
+            yq -r \
+              '.release.id' \
+              "${RELEASE_FILE}"
+
+          )
+
+          ACTUAL_SOURCE_COMMIT=$(
+
+            yq -r \
+              '.source.commit' \
+              "${RELEASE_FILE}"
+
+          )
+
+          ACTUAL_CI_RUN_ID=$(
+
+            yq -r \
+              '.ci.runId' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ "${ACTUAL_RELEASE_ID}" != "${EXPECTED_RELEASE_ID}" ]]; then
+
+            echo "ERROR: Release ID changed across job boundary."
+
+            exit 1
+
+          fi
+
+          if [[ "${ACTUAL_SOURCE_COMMIT}" != "${EXPECTED_SOURCE_COMMIT}" ]]; then
+
+            echo "ERROR: Source commit changed across job boundary."
+
+            exit 1
+
+          fi
+
+          if [[ "${ACTUAL_CI_RUN_ID}" != "${EXPECTED_CI_RUN_ID}" ]]; then
+
+            echo "ERROR: CI run identity changed across job boundary."
+
+            exit 1
+
+          fi
+
+          echo "Release Registry snapshot validation successful."
+
+      - name: Verify Registered Container Images
+
+        id: verify
+
+        env:
+
+          RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="release-registry/${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          echo "=========================================="
+          echo "Verifying release artifacts"
+          echo "=========================================="
+
+          echo "Release: ${RELEASE_ID}"
+
+          echo ""
+
+          IMAGE_COUNT=$(
+
+            yq \
+              '.images | length' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ ! "${IMAGE_COUNT}" =~ ^[0-9]+$ ]] || \
+             (( IMAGE_COUNT < 1 )); then
+
+            echo "ERROR: Release contains no images."
+
+            exit 1
+
+          fi
+
+          echo "Images to verify: ${IMAGE_COUNT}"
+
+          echo ""
+
+          VERIFIED_COUNT=0
+
+          while IFS= read -r SERVICE
+
+          do
+
+            echo "------------------------------------------"
+
+            echo "Service: ${SERVICE}"
+
+            echo "------------------------------------------"
+
+            REPOSITORY=$(
+
+              SERVICE="${SERVICE}" \
+              yq -r \
+                '.images[strenv(SERVICE)].repository' \
+                "${RELEASE_FILE}"
+
+            )
+
+            TAG=$(
+
+              SERVICE="${SERVICE}" \
+              yq -r \
+                '.images[strenv(SERVICE)].tag' \
+                "${RELEASE_FILE}"
+
+            )
+
+            DIGEST=$(
+
+              SERVICE="${SERVICE}" \
+              yq -r \
+                '.images[strenv(SERVICE)].digest' \
+                "${RELEASE_FILE}"
+
+            )
+
+            if [[ -z "${REPOSITORY}" || "${REPOSITORY}" == "null" ]]; then
+
+              echo "ERROR: Repository missing for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            if [[ -z "${TAG}" || "${TAG}" == "null" ]]; then
+
+              echo "ERROR: Tag missing for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+
+              echo "ERROR: Invalid digest for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            echo "Repository : ${REPOSITORY}"
+
+            echo "Tag        : ${TAG}"
+
+            echo "Digest     : ${DIGEST}"
+
+            if [[ "${REPOSITORY}" != */* ]]; then
+
+              echo "ERROR: Invalid ECR repository URI for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            ECR_REPOSITORY="${REPOSITORY#*/}"
+
+            if [[ -z "${ECR_REPOSITORY}" ]]; then
+
+              echo "ERROR: Unable to determine ECR repository for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            echo ""
+
+            echo "Verifying digest exists in ECR..."
+
+            ECR_DIGEST=$(
+
+              aws ecr describe-images \
+                --region "${AWS_REGION}" \
+                --repository-name "${ECR_REPOSITORY}" \
+                --image-ids imageDigest="${DIGEST}" \
+                --query 'imageDetails[0].imageDigest' \
+                --output text
+
+            )
+
+            if [[ "${ECR_DIGEST}" != "${DIGEST}" ]]; then
+
+              echo "ERROR: ECR digest verification failed for ${SERVICE}."
+
+              echo "Expected: ${DIGEST}"
+
+              echo "Actual  : ${ECR_DIGEST}"
+
+              exit 1
+
+            fi
+
+            echo "ECR digest verified."
+
+            IMAGE_REFERENCE="${REPOSITORY}@${DIGEST}"
+
+            echo ""
+
+            echo "Verifying Cosign signature..."
+
+            echo "Image: ${IMAGE_REFERENCE}"
+
+            cosign verify \
+              --certificate-oidc-issuer \
+                "https://token.actions.githubusercontent.com" \
+              --certificate-identity-regexp \
+                "^https://github.com/${{ github.repository }}/\\.github/workflows/.*@refs/heads/dev$" \
+              "${IMAGE_REFERENCE}" \
+              > /tmp/cosign-verification.json
+
+            if [[ ! -s /tmp/cosign-verification.json ]]; then
+
+              echo "ERROR: Cosign returned no verification evidence for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            echo "Cosign signature verified."
+
+            VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
+
+            echo ""
+
+            echo "${SERVICE}: VERIFIED"
+
+            echo ""
+
+          done < <(
+
+            yq -r \
+              '.images | keys | .[]' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if (( VERIFIED_COUNT != IMAGE_COUNT )); then
+
+            echo "ERROR: Artifact verification count mismatch."
+
+            echo "Expected: ${IMAGE_COUNT}"
+
+            echo "Verified: ${VERIFIED_COUNT}"
+
+            exit 1
+
+          fi
+
+          {
+
+            echo "release-id=${RELEASE_ID}"
+
+            echo "image-count=${VERIFIED_COUNT}"
+
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "=========================================="
+
+          echo "RELEASE ARTIFACT VERIFICATION SUCCESSFUL"
+
+          echo "=========================================="
+
+          echo "Release ID     : ${RELEASE_ID}"
+
+          echo "Verified images: ${VERIFIED_COUNT}"
+
+      - name: Write Artifact Verification Summary
+
+        env:
+
+          RELEASE_ID: ${{ steps.verify.outputs.release-id }}
+
+          IMAGE_COUNT: ${{ steps.verify.outputs.image-count }}
+
+          SOURCE_COMMIT: ${{ needs.resolve-release.outputs.source-commit }}
+
+          CI_RUN_ID: ${{ needs.resolve-release.outputs.ci-run-id }}
+
+          REGISTRY_COMMIT: ${{ needs.resolve-release.outputs.release-registry-commit }}
+
+        shell: bash
+
+        run: |
+
+          {
+
+            echo "## Dev Release Artifact Verification"
+
+            echo ""
+
+            echo "| Attribute | Value |"
+
+            echo "|---|---|"
+
+            echo "| Release ID | \`${RELEASE_ID}\` |"
+
+            echo "| Source Commit | \`${SOURCE_COMMIT}\` |"
+
+            echo "| Originating CI Run | \`${CI_RUN_ID}\` |"
+
+            echo "| Registry Snapshot | \`${REGISTRY_COMMIT}\` |"
+
+            echo "| Images Verified | ${IMAGE_COUNT} |"
+
+            echo "| ECR Digest Verification | Passed |"
+
+            echo "| Cosign Verification | Passed |"
+
+            echo "| Result | **Release artifacts trusted** |"
+
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  update-dev-gitops:
+
+    name: Update Dev GitOps
+
+    needs:
+      - resolve-release
+      - verify-release-artifacts
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 15
+
+    environment:
+      name: development
+
+    env:
+
+      RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
+
+      REGISTRY_COMMIT: ${{ needs.resolve-release.outputs.release-registry-commit }}
+
+      RELEASE_REGISTRY_PATH: ${{ env.RELEASE_REGISTRY_PATH }}
+
+      GITOPS_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
+
+    outputs:
+
+      release-id: ${{ steps.promote.outputs.release-id }}
+
+      gitops-commit: ${{ steps.push.outputs.gitops-commit }}
+
+      services-updated: ${{ steps.promote.outputs.services-updated }}
+
+    steps:
+
+      - name: Validate Promotion Inputs
+
+        env:
+
+          VERIFIED_RELEASE_ID: ${{ needs.verify-release-artifacts.outputs.release-id }}
+
+          VERIFIED_IMAGE_COUNT: ${{ needs.verify-release-artifacts.outputs.image-count }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "Validating Dev GitOps promotion inputs"
+          echo "=========================================="
+
+          echo "Resolved Release : ${RELEASE_ID}"
+          echo "Verified Release : ${VERIFIED_RELEASE_ID}"
+          echo "Verified Images  : ${VERIFIED_IMAGE_COUNT}"
+          echo "Registry Commit  : ${REGISTRY_COMMIT}"
+
+          if [[ -z "${RELEASE_ID}" ]]; then
+
+            echo "ERROR: Release ID is missing."
+
+            exit 1
+
+          fi
+
+          if [[ "${VERIFIED_RELEASE_ID}" != "${RELEASE_ID}" ]]; then
+
+            echo "ERROR: Verified release does not match resolved release."
+
+            echo "Resolved : ${RELEASE_ID}"
+
+            echo "Verified : ${VERIFIED_RELEASE_ID}"
+
+            exit 1
+
+          fi
+
+          if [[ ! "${VERIFIED_IMAGE_COUNT}" =~ ^[0-9]+$ ]] || \
+             (( VERIFIED_IMAGE_COUNT < 1 )); then
+
+            echo "ERROR: No verified release artifacts were provided."
+
+            exit 1
+
+          fi
+
+          if [[ ! "${REGISTRY_COMMIT}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+
+            echo "ERROR: Invalid Release Registry commit."
+
+            exit 1
+
+          fi
+
+          if [[ -z "${GITOPS_REPOSITORY}" ]]; then
+
+            echo "ERROR: GITOPS_REPOSITORY is not configured."
+
+            exit 1
+
+          fi
+
+          echo "Dev GitOps promotion inputs are valid."
+
+      - name: Checkout Writable GitOps Repository
+
+        uses: actions/checkout@v4
+
+        with:
+
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+          ref: main
+
+          path: gitops
+
+          fetch-depth: 0
+
+          persist-credentials: true
+
+      - name: Checkout Verified Release Snapshot
+
+        uses: actions/checkout@v4
+
+        with:
+
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+          ref: ${{ needs.resolve-release.outputs.release-registry-commit }}
+
+          path: release-registry
+
+          fetch-depth: 1
+
+          persist-credentials: false
+
+      - name: Install yq
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          YQ_VERSION="v4.44.3"
+
+          sudo wget \
+            --quiet \
+            --output-document=/usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+
+          sudo chmod +x /usr/local/bin/yq
+
+          yq --version
+
+      - name: Validate Verified Release Snapshot
+
+        env:
+
+          EXPECTED_RELEASE_ID: ${{ needs.verify-release-artifacts.outputs.release-id }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="release-registry/${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          if [[ ! -s "${RELEASE_FILE}" ]]; then
+
+            echo "ERROR: Verified release record is missing."
+
+            exit 1
+
+          fi
+
+          ACTUAL_RELEASE_ID=$(
+
+            yq -r \
+              '.release.id' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ "${ACTUAL_RELEASE_ID}" != "${EXPECTED_RELEASE_ID}" ]]; then
+
+            echo "ERROR: Release identity changed before GitOps update."
+
+            exit 1
+
+          fi
+
+          DEV_STATUS=$(
+
+            yq -r \
+              '.promotion.development.status' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ "${DEV_STATUS}" != "pending" ]]; then
+
+            echo "ERROR: Release is no longer eligible for Dev promotion."
+
+            echo "Development status: ${DEV_STATUS}"
+
+            exit 1
+
+          fi
+
+          echo "Verified Release Registry snapshot is valid."
+
+      - name: Promote Release to Dev Desired State
+
+        id: promote
+
+        env:
+
+          EXPECTED_IMAGE_COUNT: ${{ needs.verify-release-artifacts.outputs.image-count }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="release-registry/${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          UPDATED_COUNT=0
+
+          echo "=========================================="
+          echo "Updating Development GitOps desired state"
+          echo "=========================================="
+
+          echo "Release: ${RELEASE_ID}"
+
+          echo ""
+
+          while IFS= read -r SERVICE
+
+          do
+
+            echo "------------------------------------------"
+
+            echo "Service: ${SERVICE}"
+
+            echo "------------------------------------------"
+
+            REPOSITORY=$(
+
+              SERVICE="${SERVICE}" \
+              yq -r \
+                '.images[strenv(SERVICE)].repository' \
+                "${RELEASE_FILE}"
+
+            )
+
+            TAG=$(
+
+              SERVICE="${SERVICE}" \
+              yq -r \
+                '.images[strenv(SERVICE)].tag' \
+                "${RELEASE_FILE}"
+
+            )
+
+            DIGEST=$(
+
+              SERVICE="${SERVICE}" \
+              yq -r \
+                '.images[strenv(SERVICE)].digest' \
+                "${RELEASE_FILE}"
+
+            )
+
+            VALUES_FILE="gitops/applications/${SERVICE}/environments/dev/values.yaml"
+
+            if [[ -z "${REPOSITORY}" || "${REPOSITORY}" == "null" ]]; then
+
+              echo "ERROR: Repository missing for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+
+              echo "ERROR: Invalid digest for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            if [[ ! -f "${VALUES_FILE}" ]]; then
+
+              echo "ERROR: Dev values file does not exist."
+
+              echo "Expected: ${VALUES_FILE}"
+
+              exit 1
+
+            fi
+
+            echo "Repository : ${REPOSITORY}"
+
+            echo "Tag        : ${TAG}"
+
+            echo "Digest     : ${DIGEST}"
+
+            echo "Values     : ${VALUES_FILE}"
+
+            export REPOSITORY
+            export TAG
+            export DIGEST
+            export RELEASE_ID
+
+            yq -i '
+
+              .image.repository = strenv(REPOSITORY) |
+
+              .image.tag = strenv(TAG) |
+
+              .image.digest = strenv(DIGEST)
+
+            ' "${VALUES_FILE}"
+
+            ACTUAL_REPOSITORY=$(
+
+              yq -r \
+                '.image.repository' \
+                "${VALUES_FILE}"
+
+            )
+
+            ACTUAL_TAG=$(
+
+              yq -r \
+                '.image.tag' \
+                "${VALUES_FILE}"
+
+            )
+
+            ACTUAL_DIGEST=$(
+
+              yq -r \
+                '.image.digest' \
+                "${VALUES_FILE}"
+
+            )
+
+            if [[ "${ACTUAL_REPOSITORY}" != "${REPOSITORY}" ]]; then
+
+              echo "ERROR: Repository update failed for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            if [[ "${ACTUAL_TAG}" != "${TAG}" ]]; then
+
+              echo "ERROR: Tag update failed for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            if [[ "${ACTUAL_DIGEST}" != "${DIGEST}" ]]; then
+
+              echo "ERROR: Digest update failed for ${SERVICE}."
+
+              exit 1
+
+            fi
+
+            UPDATED_COUNT=$((UPDATED_COUNT + 1))
+
+            echo "${SERVICE}: desired state updated."
+
+            echo ""
+
+          done < <(
+
+            yq -r \
+              '.images | keys | .[]' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if (( UPDATED_COUNT != EXPECTED_IMAGE_COUNT )); then
+
+            echo "ERROR: GitOps update count does not match verified artifact count."
+
+            echo "Verified : ${EXPECTED_IMAGE_COUNT}"
+
+            echo "Updated  : ${UPDATED_COUNT}"
+
+            exit 1
+
+          fi
+
+          {
+
+            echo "release-id=${RELEASE_ID}"
+
+            echo "services-updated=${UPDATED_COUNT}"
+
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "=========================================="
+
+          echo "DEV DESIRED STATE UPDATE COMPLETE"
+
+          echo "=========================================="
+
+          echo "Release          : ${RELEASE_ID}"
+
+          echo "Services updated : ${UPDATED_COUNT}"
+
+      - name: Review GitOps Changes
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "GitOps changes"
+          echo "=========================================="
+
+          git status --short
+
+          echo ""
+
+          git diff -- \
+            'applications/*/environments/dev/values.yaml'
+
+      - name: Validate GitOps Change Scope
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          CHANGED_FILES=$(
+
+            git diff \
+              --name-only
+
+          )
+
+          if [[ -z "${CHANGED_FILES}" ]]; then
+
+            echo "ERROR: Promotion produced no GitOps changes."
+
+            echo "The requested release may already be configured in Dev."
+
+            exit 1
+
+          fi
+
+          INVALID_CHANGE=false
+
+          while IFS= read -r FILE
+
+          do
+
+            [[ -z "${FILE}" ]] && continue
+
+            if [[ "${FILE}" =~ ^applications/[^/]+/environments/dev/values\.yaml$ ]]; then
+
+              echo "Allowed change: ${FILE}"
+
+            else
+
+              echo "ERROR: Unauthorized GitOps change detected: ${FILE}"
+
+              INVALID_CHANGE=true
+
+            fi
+
+          done <<< "${CHANGED_FILES}"
+
+          if [[ "${INVALID_CHANGE}" == "true" ]]; then
+
+            echo "ERROR: GitOps change scope validation failed."
+
+            exit 1
+
+          fi
+
+          echo "GitOps change scope validation successful."
+
+      - name: Configure Git Identity
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit Dev Promotion
+
+        id: commit
+
+        working-directory: gitops
+
+        env:
+
+          CI_RUN_ID: ${{ needs.resolve-release.outputs.ci-run-id }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          git add -- \
+            'applications/*/environments/dev/values.yaml'
+
+          if git diff --cached --quiet; then
+
+            echo "ERROR: No Dev GitOps changes were staged."
+
+            exit 1
+
+          fi
+
+          git commit \
+            -m "deploy(dev): promote release ${RELEASE_ID}" \
+            -m "Source CI run: ${CI_RUN_ID}"
+
+          echo "Created local GitOps commit: $(git rev-parse HEAD)"
+
+      - name: Push Dev Promotion
+
+        id: push
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          echo "Refreshing GitOps main before push..."
+
+          git pull \
+            --rebase \
+            origin \
+            main
+
+          echo "Pushing Dev promotion..."
+
+          git push \
+            origin \
+            HEAD:main
+
+          GITOPS_COMMIT=$(git rev-parse HEAD)
+
+          echo "gitops-commit=${GITOPS_COMMIT}" >> "${GITHUB_OUTPUT}"
+
+          echo "Dev GitOps promotion pushed successfully."
+          echo "Final GitOps commit: ${GITOPS_COMMIT}"
+
+      - name: Verify GitOps Push
+
+        working-directory: gitops
+
+        env:
+
+          EXPECTED_COMMIT: ${{ steps.push.outputs.gitops-commit }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          git fetch \
+            origin \
+            main
+
+          if ! git merge-base \
+            --is-ancestor \
+            "${EXPECTED_COMMIT}" \
+            "origin/main"; then
+
+            echo "ERROR: Dev promotion commit is not present on GitOps main."
+
+            echo "Expected commit: ${EXPECTED_COMMIT}"
+
+            exit 1
+
+          fi
+
+          echo "GitOps commit confirmed on remote main."
+
+          echo "Commit: ${EXPECTED_COMMIT}"
+
+      - name: Write GitOps Promotion Summary
+
+        env:
+
+          GITOPS_COMMIT: ${{ steps.push.outputs.gitops-commit }}
+
+          SERVICES_UPDATED: ${{ steps.promote.outputs.services-updated }}
+
+          SOURCE_COMMIT: ${{ needs.resolve-release.outputs.source-commit }}
+
+        shell: bash
+
+        run: |
+
+          {
+
+            echo "## Development GitOps Promotion"
+
+            echo ""
+
+            echo "| Attribute | Value |"
+
+            echo "|---|---|"
+
+            echo "| Release ID | \`${RELEASE_ID}\` |"
+
+            echo "| Source Commit | \`${SOURCE_COMMIT}\` |"
+
+            echo "| GitOps Commit | \`${GITOPS_COMMIT}\` |"
+
+            echo "| Services Updated | ${SERVICES_UPDATED} |"
+
+            echo "| Desired State | Updated |"
+
+            echo "| ArgoCD Deployment | Not yet verified |"
+
+            echo "| Promotion State | Pending Job 4 recording |"
+
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  record-dev-promotion:
+
+    name: Record Dev Promotion
+
+    needs:
+      - resolve-release
+      - verify-release-artifacts
+      - update-dev-gitops
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
+    environment:
+      name: development
+
+    env:
+
+      RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
+
+      SOURCE_COMMIT: ${{ needs.resolve-release.outputs.source-commit }}
+
+      CI_RUN_ID: ${{ needs.resolve-release.outputs.ci-run-id }}
+
+      GITOPS_COMMIT: ${{ needs.update-dev-gitops.outputs.gitops-commit }}
+
+      SERVICES_UPDATED: ${{ needs.update-dev-gitops.outputs.services-updated }}
+
+      GITOPS_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
+
+      RELEASE_REGISTRY_PATH: ${{ env.RELEASE_REGISTRY_PATH }}
+
+    outputs:
+
+      release-id: ${{ steps.record.outputs.release-id }}
+
+      promotion-status: ${{ steps.record.outputs.promotion-status }}
+
+      promotion-commit: ${{ steps.push.outputs.promotion-commit }}
+
+    steps:
+
+      - name: Validate Promotion Evidence
+
+        env:
+
+          VERIFIED_RELEASE_ID: ${{ needs.verify-release-artifacts.outputs.release-id }}
+
+          VERIFIED_IMAGE_COUNT: ${{ needs.verify-release-artifacts.outputs.image-count }}
+
+          GITOPS_RELEASE_ID: ${{ needs.update-dev-gitops.outputs.release-id }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "Validating Development promotion evidence"
+          echo "=========================================="
+
+          echo "Release ID       : ${RELEASE_ID}"
+          echo "Source Commit    : ${SOURCE_COMMIT}"
+          echo "CI Run ID        : ${CI_RUN_ID}"
+          echo "GitOps Commit    : ${GITOPS_COMMIT}"
+          echo "Services Updated : ${SERVICES_UPDATED}"
+
+          if [[ -z "${RELEASE_ID}" ]]; then
+
+            echo "ERROR: Release ID is missing."
+
+            exit 1
+
+          fi
+
+          if [[ "${VERIFIED_RELEASE_ID}" != "${RELEASE_ID}" ]]; then
+
+            echo "ERROR: Artifact verification release mismatch."
+
+            exit 1
+
+          fi
+
+          if [[ "${GITOPS_RELEASE_ID}" != "${RELEASE_ID}" ]]; then
+
+            echo "ERROR: GitOps promotion release mismatch."
+
+            exit 1
+
+          fi
+
+          if [[ -z "${SOURCE_COMMIT}" ]]; then
+
+            echo "ERROR: Source commit is missing."
+
+            exit 1
+
+          fi
+
+          if [[ ! "${CI_RUN_ID}" =~ ^[0-9]+$ ]]; then
+
+            echo "ERROR: Invalid originating CI run ID."
+
+            exit 1
+
+          fi
+
+          if [[ ! "${GITOPS_COMMIT}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+
+            echo "ERROR: Invalid GitOps commit."
+
+            exit 1
+
+          fi
+
+          if [[ ! "${SERVICES_UPDATED}" =~ ^[0-9]+$ ]] || \
+             (( SERVICES_UPDATED < 1 )); then
+
+            echo "ERROR: Invalid number of promoted services."
+
+            exit 1
+
+          fi
+
+          if [[ "${SERVICES_UPDATED}" != "${VERIFIED_IMAGE_COUNT}" ]]; then
+
+            echo "ERROR: Verified artifact count does not match GitOps update count."
+
+            echo "Verified : ${VERIFIED_IMAGE_COUNT}"
+            echo "Updated  : ${SERVICES_UPDATED}"
+
+            exit 1
+
+          fi
+
+          if [[ -z "${GITOPS_REPOSITORY}" ]]; then
+
+            echo "ERROR: GITOPS_REPOSITORY is not configured."
+
+            exit 1
+
+          fi
+
+          echo "Development promotion evidence is valid."
+
+      - name: Checkout Release Registry
+
+        uses: actions/checkout@v4
+
+        with:
+
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+          ref: main
+
+          path: gitops
+
+          fetch-depth: 0
+
+          persist-credentials: true
+
+      - name: Install yq
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          YQ_VERSION="v4.44.3"
+
+          sudo wget \
+            --quiet \
+            --output-document=/usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+
+          sudo chmod +x /usr/local/bin/yq
+
+          yq --version
+
+      - name: Validate Current Release State
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="gitops/${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          if [[ ! -s "${RELEASE_FILE}" ]]; then
+
+            echo "ERROR: Release record does not exist."
+
+            echo "Expected: ${RELEASE_FILE}"
+
+            exit 1
+
+          fi
+
+          REGISTERED_RELEASE_ID=$(
+
+            yq -r \
+              '.release.id' \
+              "${RELEASE_FILE}"
+
+          )
+
+          REGISTERED_SOURCE_COMMIT=$(
+
+            yq -r \
+              '.source.commit' \
+              "${RELEASE_FILE}"
+
+          )
+
+          REGISTERED_CI_RUN_ID=$(
+
+            yq -r \
+              '.ci.runId' \
+              "${RELEASE_FILE}"
+
+          )
+
+          CI_STATUS=$(
+
+            yq -r \
+              '.ci.status' \
+              "${RELEASE_FILE}"
+
+          )
+
+          CURRENT_DEV_STATUS=$(
+
+            yq -r \
+              '.promotion.development.status' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ "${REGISTERED_RELEASE_ID}" != "${RELEASE_ID}" ]]; then
+
+            echo "ERROR: Release Registry identity mismatch."
+
+            exit 1
+
+          fi
+
+          if [[ "${REGISTERED_SOURCE_COMMIT}" != "${SOURCE_COMMIT}" ]]; then
+
+            echo "ERROR: Release source commit changed."
+
+            exit 1
+
+          fi
+
+          if [[ "${REGISTERED_CI_RUN_ID}" != "${CI_RUN_ID}" ]]; then
+
+            echo "ERROR: Release CI identity changed."
+
+            exit 1
+
+          fi
+
+          if [[ "${CI_STATUS}" != "passed" ]]; then
+
+            echo "ERROR: Release CI status is no longer passed."
+
+            exit 1
+
+          fi
+
+          if [[ "${CURRENT_DEV_STATUS}" != "pending" ]]; then
+
+            echo "ERROR: Invalid Development promotion transition."
+
+            echo "Expected current state: pending"
+
+            echo "Actual current state  : ${CURRENT_DEV_STATUS}"
+
+            exit 1
+
+          fi
+
+          echo "Current Release Registry state is valid."
+
+          echo "Allowed transition: pending -> gitops-updated"
+
+      - name: Verify Dev GitOps Commit
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          git fetch \
+            origin \
+            main
+
+          if ! git cat-file \
+            -e \
+            "${GITOPS_COMMIT}^{commit}"; then
+
+            echo "ERROR: GitOps commit does not exist."
+
+            echo "Commit: ${GITOPS_COMMIT}"
+
+            exit 1
+
+          fi
+
+          if ! git merge-base \
+            --is-ancestor \
+            "${GITOPS_COMMIT}" \
+            "origin/main"; then
+
+            echo "ERROR: GitOps promotion commit is not present on main."
+
+            echo "Commit: ${GITOPS_COMMIT}"
+
+            exit 1
+
+          fi
+
+          echo "GitOps promotion commit verified."
+
+          echo "Commit: ${GITOPS_COMMIT}"
+
+      - name: Record Development Promotion
+
+        id: record
+
+        env:
+
+          DEPLOY_WORKFLOW_RUN_ID: ${{ github.run_id }}
+
+          DEPLOY_WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+
+          ACTOR: ${{ github.actor }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="gitops/${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          UPDATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          export UPDATED_AT
+          export GITOPS_COMMIT
+          export DEPLOY_WORKFLOW_RUN_ID
+          export DEPLOY_WORKFLOW_RUN_ATTEMPT
+          export SERVICES_UPDATED
+          export ACTOR
+
+          yq -i '
+
+            .promotion.development.status = "gitops-updated" |
+
+            .promotion.development.updatedAt = strenv(UPDATED_AT) |
+
+            .promotion.development.gitopsCommit = strenv(GITOPS_COMMIT) |
+
+            .promotion.development.workflowRunId = strenv(DEPLOY_WORKFLOW_RUN_ID) |
+
+            .promotion.development.workflowRunAttempt = strenv(DEPLOY_WORKFLOW_RUN_ATTEMPT) |
+
+            .promotion.development.servicesUpdated = (strenv(SERVICES_UPDATED) | tonumber) |
+
+            .promotion.development.actor = strenv(ACTOR)
+
+          ' "${RELEASE_FILE}"
+
+          NEW_STATUS=$(
+
+            yq -r \
+              '.promotion.development.status' \
+              "${RELEASE_FILE}"
+
+          )
+
+          RECORDED_GITOPS_COMMIT=$(
+
+            yq -r \
+              '.promotion.development.gitopsCommit' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ "${NEW_STATUS}" != "gitops-updated" ]]; then
+
+            echo "ERROR: Failed to update Development promotion status."
+
+            exit 1
+
+          fi
+
+          if [[ "${RECORDED_GITOPS_COMMIT}" != "${GITOPS_COMMIT}" ]]; then
+
+            echo "ERROR: Failed to record GitOps commit."
+
+            exit 1
+
+          fi
+
+          {
+
+            echo "release-id=${RELEASE_ID}"
+
+            echo "promotion-status=${NEW_STATUS}"
+
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Development promotion metadata updated."
+
+          echo "Status       : ${NEW_STATUS}"
+
+          echo "Updated At   : ${UPDATED_AT}"
+
+          echo "GitOps Commit: ${GITOPS_COMMIT}"
+
+      - name: Validate Release Registry Change Scope
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          EXPECTED_FILE="${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          CHANGED_FILES=$(
+
+            git diff \
+              --name-only
+
+          )
+
+          if [[ -z "${CHANGED_FILES}" ]]; then
+
+            echo "ERROR: No Release Registry changes detected."
+
+            exit 1
+
+          fi
+
+          CHANGE_COUNT=$(
+
+            printf '%s\n' "${CHANGED_FILES}" \
+              | sed '/^[[:space:]]*$/d' \
+              | wc -l \
+              | tr -d ' '
+
+          )
+
+          if [[ "${CHANGE_COUNT}" != "1" ]]; then
+
+            echo "ERROR: Promotion recorder modified more than one file."
+
+            echo "Changed files:"
+
+            printf '%s\n' "${CHANGED_FILES}"
+
+            exit 1
+
+          fi
+
+          if [[ "${CHANGED_FILES}" != "${EXPECTED_FILE}" ]]; then
+
+            echo "ERROR: Unauthorized Release Registry modification."
+
+            echo "Expected: ${EXPECTED_FILE}"
+
+            echo "Actual  : ${CHANGED_FILES}"
+
+            exit 1
+
+          fi
+
+          echo "Release Registry mutation scope validated."
+
+          echo "Modified: ${EXPECTED_FILE}"
+
+      - name: Verify Immutable Release Metadata
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          git show "HEAD:${RELEASE_FILE}" \
+            > /tmp/release-before.yaml
+
+          yq -o=json \
+            '{
+              "schemaVersion": .schemaVersion,
+              "release": .release,
+              "source": .source,
+              "ci": .ci,
+              "images": .images,
+              "staging": .promotion.staging,
+              "production": .promotion.production
+            }' \
+            /tmp/release-before.yaml \
+            > /tmp/immutable-before.json
+
+          yq -o=json \
+            '{
+              "schemaVersion": .schemaVersion,
+              "release": .release,
+              "source": .source,
+              "ci": .ci,
+              "images": .images,
+              "staging": .promotion.staging,
+              "production": .promotion.production
+            }' \
+            "${RELEASE_FILE}" \
+            > /tmp/immutable-after.json
+
+          if ! diff \
+            -u \
+            /tmp/immutable-before.json \
+            /tmp/immutable-after.json; then
+
+            echo "ERROR: Immutable release metadata was modified."
+
+            exit 1
+
+          fi
+
+          echo "Immutable release metadata remains unchanged."
+
+      - name: Configure Git Identity
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit Development Promotion State
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          git add -- "${RELEASE_FILE}"
+
+          if git diff --cached --quiet; then
+
+            echo "ERROR: No promotion-state change was staged."
+
+            exit 1
+
+          fi
+
+          git commit \
+            -m "release: record dev promotion ${RELEASE_ID}" \
+            -m "GitOps commit: ${GITOPS_COMMIT}" \
+            -m "Workflow run: ${{ github.run_id }}"
+
+      - name: Push Development Promotion State
+
+        id: push
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          git pull \
+            --rebase \
+            origin \
+            main
+
+          RELEASE_FILE="${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          FINAL_STATUS=$(
+
+            yq -r \
+              '.promotion.development.status' \
+              "${RELEASE_FILE}"
+
+          )
+
+          FINAL_GITOPS_COMMIT=$(
+
+            yq -r \
+              '.promotion.development.gitopsCommit' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ "${FINAL_STATUS}" != "gitops-updated" ]]; then
+
+            echo "ERROR: Development promotion state changed during rebase."
+
+            exit 1
+
+          fi
+
+          if [[ "${FINAL_GITOPS_COMMIT}" != "${GITOPS_COMMIT}" ]]; then
+
+            echo "ERROR: GitOps evidence changed during rebase."
+
+            exit 1
+
+          fi
+
+          git push \
+            origin \
+            HEAD:main
+
+          PROMOTION_COMMIT=$(git rev-parse HEAD)
+
+          echo "promotion-commit=${PROMOTION_COMMIT}" >> "${GITHUB_OUTPUT}"
+
+          echo "Development promotion state pushed."
+
+          echo "Registry commit: ${PROMOTION_COMMIT}"
+
+      - name: Verify Promotion Record
+
+        working-directory: gitops
+
+        env:
+
+          PROMOTION_COMMIT: ${{ steps.push.outputs.promotion-commit }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          git fetch \
+            origin \
+            main
+
+          if ! git merge-base \
+            --is-ancestor \
+            "${PROMOTION_COMMIT}" \
+            "origin/main"; then
+
+            echo "ERROR: Promotion record is not present on remote main."
+
+            exit 1
+
+          fi
+
+          echo "Promotion record confirmed on remote main."
+
+          echo "Commit: ${PROMOTION_COMMIT}"
+
+      - name: Write Development Promotion Summary
+
+        env:
+
+          PROMOTION_STATUS: ${{ steps.record.outputs.promotion-status }}
+
+          PROMOTION_COMMIT: ${{ steps.push.outputs.promotion-commit }}
+
+        shell: bash
+
+        run: |
+
+          {
+
+            echo "## Development Release Promotion"
+
+            echo ""
+
+            echo "| Attribute | Value |"
+
+            echo "|---|---|"
+
+            echo "| Release ID | \`${RELEASE_ID}\` |"
+
+            echo "| Source Commit | \`${SOURCE_COMMIT}\` |"
+
+            echo "| Originating CI Run | \`${CI_RUN_ID}\` |"
+
+            echo "| GitOps Commit | \`${GITOPS_COMMIT}\` |"
+
+            echo "| Services Updated | ${SERVICES_UPDATED} |"
+
+            echo "| Promotion Status | **${PROMOTION_STATUS}** |"
+
+            echo "| Registry Commit | \`${PROMOTION_COMMIT}\` |"
+
+            echo "| ArgoCD Health | Not yet verified |"
+
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  verify-dev-deployment:
+
+    name: Verify Dev Deployment
+
+    needs:
+      - resolve-release
+      - verify-release-artifacts
+      - update-dev-gitops
+      - record-dev-promotion
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    environment:
+      name: development
+
+    env:
+
+      RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
+
+      GITOPS_COMMIT: ${{ needs.update-dev-gitops.outputs.gitops-commit }}
+
+      RELEASE_REGISTRY_PATH: ${{ env.RELEASE_REGISTRY_PATH }}
+
+      ARGOCD_SERVER: ${{ vars.ARGOCD_SERVER }}
+
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+
+      DEV_BASE_URL: ${{ vars.DEV_BASE_URL }}
+
+    outputs:
+
+      release-id: ${{ steps.verify.outputs.release-id }}
+
+      applications-verified: ${{ steps.verify.outputs.applications-verified }}
+
+      smoke-test-status: ${{ steps.smoke.outputs.status }}
+
+    steps:
+
+      - name: Validate Verification Inputs
+
+        env:
+
+          PROMOTION_STATUS: ${{ needs.record-dev-promotion.outputs.promotion-status }}
+
+          PROMOTED_RELEASE_ID: ${{ needs.record-dev-promotion.outputs.release-id }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          if [[ "${PROMOTED_RELEASE_ID}" != "${RELEASE_ID}" ]]; then
+            echo "ERROR: Promotion release mismatch."
             exit 1
           fi
 
-      ####################################################################
-      # Read Current Environment State
-      ####################################################################
-      - name: Read Environment State
-        id: environment
+          if [[ "${PROMOTION_STATUS}" != "gitops-updated" ]]; then
+            echo "ERROR: Release has not reached gitops-updated."
+            exit 1
+          fi
+
+          if [[ ! "${GITOPS_COMMIT}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "ERROR: Invalid GitOps commit."
+            exit 1
+          fi
+
+          if [[ -z "${ARGOCD_SERVER}" ]]; then
+            echo "ERROR: ARGOCD_SERVER is not configured."
+            exit 1
+          fi
+
+          if [[ -z "${ARGOCD_AUTH_TOKEN}" ]]; then
+            echo "ERROR: ARGOCD_AUTH_TOKEN is not configured."
+            exit 1
+          fi
+
+          echo "Deployment verification inputs are valid."
+
+      - name: Checkout Verified Release Snapshot
+
+        uses: actions/checkout@v4
+
+        with:
+
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+          ref: ${{ needs.resolve-release.outputs.release-registry-commit }}
+
+          path: release-registry
+
+          fetch-depth: 1
+
+          persist-credentials: false
+
+      - name: Install yq
+
+        shell: bash
+
         run: |
+
           set -euo pipefail
 
-          FILE="gitops/${ENVIRONMENT_FILE}"
+          YQ_VERSION="v4.44.3"
 
-          CURRENT_RELEASE=$(yq '.currentRelease' "$FILE")
+          sudo wget \
+            --quiet \
+            --output-document=/usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
 
-          echo "Current Release: ${CURRENT_RELEASE}"
+          sudo chmod +x /usr/local/bin/yq
 
-          echo "current=${CURRENT_RELEASE}" >> "$GITHUB_OUTPUT"
-          echo "rollback=${CURRENT_RELEASE}" >> "$GITHUB_OUTPUT"
+          yq --version
 
-      ####################################################################
-      # Update Desired Release
-      ####################################################################
-      - name: Set Desired Release
+      - name: Install Argo CD CLI
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          ARGOCD_VERSION="v3.1.0"
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --output /tmp/argocd \
+            "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64"
+
+          sudo install \
+            -m 0555 \
+            /tmp/argocd \
+            /usr/local/bin/argocd
+
+          argocd version --client
+
+      - name: Verify Argo CD Connectivity
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          argocd account get-user-info \
+            --server "${ARGOCD_SERVER}" \
+            --auth-token "${ARGOCD_AUTH_TOKEN}" \
+            --grpc-web
+
+      - name: Wait for Dev Applications
+
+        id: verify
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="release-registry/${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          if [[ ! -s "${RELEASE_FILE}" ]]; then
+            echo "ERROR: Release Registry record missing."
+            exit 1
+          fi
+
+          EXPECTED_COUNT=$(yq '.images | length' "${RELEASE_FILE}")
+
+          VERIFIED_COUNT=0
+
+          while IFS= read -r SERVICE
+          do
+
+            ARGO_APP="${SERVICE}"
+
+            echo "=========================================="
+            echo "Waiting for ${ARGO_APP}"
+            echo "=========================================="
+
+            argocd app wait "${ARGO_APP}" \
+              --server "${ARGOCD_SERVER}" \
+              --auth-token "${ARGOCD_AUTH_TOKEN}" \
+              --grpc-web \
+              --sync \
+              --health \
+              --timeout 600
+
+            SYNC_STATUS=$(
+
+              argocd app get "${ARGO_APP}" \
+                --server "${ARGOCD_SERVER}" \
+                --auth-token "${ARGOCD_AUTH_TOKEN}" \
+                --grpc-web \
+                --output json \
+              | jq -r '.status.sync.status'
+
+            )
+
+            HEALTH_STATUS=$(
+
+              argocd app get "${ARGO_APP}" \
+                --server "${ARGOCD_SERVER}" \
+                --auth-token "${ARGOCD_AUTH_TOKEN}" \
+                --grpc-web \
+                --output json \
+              | jq -r '.status.health.status'
+
+            )
+
+            REVISION=$(
+
+              argocd app get "${ARGO_APP}" \
+                --server "${ARGOCD_SERVER}" \
+                --auth-token "${ARGOCD_AUTH_TOKEN}" \
+                --grpc-web \
+                --output json \
+              | jq -r '.status.sync.revision'
+
+            )
+
+            echo "Application : ${ARGO_APP}"
+            echo "Sync        : ${SYNC_STATUS}"
+            echo "Health      : ${HEALTH_STATUS}"
+            echo "Revision    : ${REVISION}"
+
+            if [[ "${SYNC_STATUS}" != "Synced" ]]; then
+              echo "ERROR: ${ARGO_APP} is not Synced."
+              exit 1
+            fi
+
+            if [[ "${HEALTH_STATUS}" != "Healthy" ]]; then
+              echo "ERROR: ${ARGO_APP} is not Healthy."
+              exit 1
+            fi
+
+            if [[ "${REVISION}" != "${GITOPS_COMMIT}" ]]; then
+              echo "ERROR: ${ARGO_APP} is healthy but not reconciled to the promoted GitOps commit."
+              echo "Expected revision: ${GITOPS_COMMIT}"
+              echo "Actual revision  : ${REVISION}"
+              exit 1
+            fi
+
+            VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
+
+          done < <(
+
+            yq -r \
+              '.images | keys | .[]' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if (( VERIFIED_COUNT != EXPECTED_COUNT )); then
+
+            echo "ERROR: Argo CD verification count mismatch."
+
+            echo "Expected : ${EXPECTED_COUNT}"
+            echo "Verified : ${VERIFIED_COUNT}"
+
+            exit 1
+
+          fi
+
+          {
+            echo "release-id=${RELEASE_ID}"
+            echo "applications-verified=${VERIFIED_COUNT}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "All Development applications are Synced and Healthy."
+
+      - name: Run Development Smoke Test
+
+        id: smoke
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          if [[ -z "${DEV_BASE_URL}" ]]; then
+            echo "status=not-configured" >> "${GITHUB_OUTPUT}"
+            echo "DEV_BASE_URL is not configured; smoke test skipped."
+            exit 0
+          fi
+
+          HEALTH_URL="${DEV_BASE_URL%/}/health"
+
+          echo "Smoke testing:"
+          echo "${HEALTH_URL}"
+
+          MAX_ATTEMPTS=5
+          ATTEMPT=1
+
+          while (( ATTEMPT <= MAX_ATTEMPTS ))
+          do
+
+            HTTP_STATUS=$(
+
+              curl \
+                --silent \
+                --show-error \
+                --output /tmp/health-response \
+                --write-out "%{http_code}" \
+                --max-time 15 \
+                "${HEALTH_URL}" \
+              || true
+
+            )
+
+            echo "Attempt ${ATTEMPT}: HTTP ${HTTP_STATUS}"
+
+            if [[ "${HTTP_STATUS}" == "200" ]]; then
+
+              echo "status=passed" >> "${GITHUB_OUTPUT}"
+              echo "Development smoke test successful."
+
+              exit 0
+
+            fi
+
+            if (( ATTEMPT == MAX_ATTEMPTS )); then
+
+              echo "ERROR: Development smoke test failed."
+
+              cat /tmp/health-response 2>/dev/null || true
+
+              exit 1
+
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+
+            sleep 10
+
+          done
+
+      - name: Write Deployment Verification Summary
+
         env:
-          RELEASE_SHA: ${{ steps.release.outputs.RELEASE_SHA }}
+
+          APPLICATION_COUNT: ${{ steps.verify.outputs.applications-verified }}
+
+          SMOKE_TEST_STATUS: ${{ steps.smoke.outputs.status }}
+
+        shell: bash
+
         run: |
+
+          {
+
+            echo "## Development Deployment Verification"
+
+            echo ""
+
+            echo "| Attribute | Result |"
+
+            echo "|---|---|"
+
+            echo "| Release | \`${RELEASE_ID}\` |"
+
+            echo "| GitOps Commit | \`${GITOPS_COMMIT}\` |"
+
+            echo "| Applications Verified | ${APPLICATION_COUNT} |"
+
+            echo "| Argo CD Sync | Passed |"
+
+            echo "| Argo CD Health | Passed |"
+
+            echo "| Smoke Test | ${SMOKE_TEST_STATUS} |"
+
+            echo "| Result | **Development deployment verified** |"
+
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  record-dev-verification:
+
+    name: Record Dev Verification
+
+    needs:
+      - resolve-release
+      - update-dev-gitops
+      - record-dev-promotion
+      - verify-dev-deployment
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
+    environment:
+      name: development
+
+    env:
+
+      RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
+
+      GITOPS_COMMIT: ${{ needs.update-dev-gitops.outputs.gitops-commit }}
+
+      APPLICATIONS_VERIFIED: ${{ needs.verify-dev-deployment.outputs.applications-verified }}
+
+      SMOKE_TEST_STATUS: ${{ needs.verify-dev-deployment.outputs.smoke-test-status }}
+
+      RELEASE_REGISTRY_PATH: ${{ env.RELEASE_REGISTRY_PATH }}
+
+    outputs:
+
+      release-id: ${{ steps.record.outputs.release-id }}
+
+      development-status: ${{ steps.record.outputs.development-status }}
+
+      verification-commit: ${{ steps.push.outputs.verification-commit }}
+
+    steps:
+
+      - name: Validate Verification Evidence
+
+        env:
+
+          VERIFIED_RELEASE_ID: ${{ needs.verify-dev-deployment.outputs.release-id }}
+
+          CURRENT_PROMOTION_STATUS: ${{ needs.record-dev-promotion.outputs.promotion-status }}
+
+        shell: bash
+
+        run: |
+
           set -euo pipefail
 
-          FILE="gitops/${ENVIRONMENT_FILE}"
+          if [[ "${VERIFIED_RELEASE_ID}" != "${RELEASE_ID}" ]]; then
+
+            echo "ERROR: Deployment verification release mismatch."
+
+            exit 1
+
+          fi
+
+          if [[ "${CURRENT_PROMOTION_STATUS}" != "gitops-updated" ]]; then
+
+            echo "ERROR: Development promotion has not reached gitops-updated."
+
+            exit 1
+
+          fi
+
+          if [[ ! "${APPLICATIONS_VERIFIED}" =~ ^[0-9]+$ ]] || \
+             (( APPLICATIONS_VERIFIED < 1 )); then
+
+            echo "ERROR: No applications were verified."
+
+            exit 1
+
+          fi
+
+          echo "Development verification evidence is valid."
+
+      - name: Checkout Release Registry
+
+        uses: actions/checkout@v4
+
+        with:
+
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+          ref: main
+
+          path: gitops
+
+          fetch-depth: 0
+
+          persist-credentials: true
+
+      - name: Install yq
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          YQ_VERSION="v4.44.3"
+
+          sudo wget \
+            --quiet \
+            --output-document=/usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+
+          sudo chmod +x /usr/local/bin/yq
+
+          yq --version
+
+      - name: Validate Current Development State
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="gitops/${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          if [[ ! -s "${RELEASE_FILE}" ]]; then
+
+            echo "ERROR: Release record not found."
+
+            exit 1
+
+          fi
+
+          REGISTERED_RELEASE_ID=$(
+
+            yq -r \
+              '.release.id' \
+              "${RELEASE_FILE}"
+
+          )
+
+          CURRENT_STATUS=$(
+
+            yq -r \
+              '.promotion.development.status' \
+              "${RELEASE_FILE}"
+
+          )
+
+          RECORDED_GITOPS_COMMIT=$(
+
+            yq -r \
+              '.promotion.development.gitopsCommit' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ "${REGISTERED_RELEASE_ID}" != "${RELEASE_ID}" ]]; then
+
+            echo "ERROR: Release identity mismatch."
+
+            exit 1
+
+          fi
+
+          if [[ "${CURRENT_STATUS}" != "gitops-updated" ]]; then
+
+            echo "ERROR: Invalid lifecycle transition."
+
+            echo "Expected: gitops-updated"
+            echo "Actual  : ${CURRENT_STATUS}"
+
+            exit 1
+
+          fi
+
+          if [[ "${RECORDED_GITOPS_COMMIT}" != "${GITOPS_COMMIT}" ]]; then
+
+            echo "ERROR: Verified GitOps commit does not match Registry evidence."
+
+            exit 1
+
+          fi
+
+          echo "Allowed transition: gitops-updated -> verified"
+
+      - name: Record Development Verification
+
+        id: record
+
+        env:
+
+          VERIFICATION_RUN_ID: ${{ github.run_id }}
+
+          VERIFICATION_RUN_ATTEMPT: ${{ github.run_attempt }}
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="gitops/${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          VERIFIED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          export VERIFIED_AT
+          export APPLICATIONS_VERIFIED
+          export VERIFICATION_RUN_ID
+          export VERIFICATION_RUN_ATTEMPT
+          export SMOKE_TEST_STATUS
 
           yq -i '
-            .desiredRelease = strenv(RELEASE_SHA) |
-            .status = "deploying"
-          ' "$FILE"
 
-          echo "Desired Release Updated"
+            .promotion.development.status = "verified" |
 
-          cat "$FILE"
+            .promotion.development.verifiedAt = strenv(VERIFIED_AT) |
 
+            .promotion.development.verificationWorkflowRunId =
+              strenv(VERIFICATION_RUN_ID) |
 
-            ####################################################################
-        # Validate Deployment Manifest
-        ####################################################################
-      ####################################################################
-# Validate Deployment Manifest
-####################################################################
-      - name: Validate Deployment Manifest
-        run: |
-            set -euo pipefail
+            .promotion.development.verificationWorkflowRunAttempt =
+              strenv(VERIFICATION_RUN_ATTEMPT) |
 
-            FILE="deployment-manifest/deployment-manifest.json"
+            .promotion.development.applicationsVerified =
+              (strenv(APPLICATIONS_VERIFIED) | tonumber) |
 
-            jq empty "$FILE"
+            .promotion.development.smokeTestStatus =
+              strenv(SMOKE_TEST_STATUS)
 
-            jq -e '.schemaVersion' "$FILE" >/dev/null
-            jq -e '.releaseId' "$FILE" >/dev/null
-            jq -e '.images' "$FILE" >/dev/null
+          ' "${RELEASE_FILE}"
 
-            COUNT=$(jq '.images | length' "$FILE")
+          NEW_STATUS=$(
 
-            if [[ "$COUNT" -eq 0 ]]; then
-            echo "Deployment manifest contains no images."
+            yq -r \
+              '.promotion.development.status' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ "${NEW_STATUS}" != "verified" ]]; then
+
+            echo "ERROR: Failed to record Development verification."
+
             exit 1
-            fi
 
-            echo "Release: $(jq -r '.releaseId' "$FILE")"
-            echo "Found $COUNT image(s)."
+          fi
 
-        ####################################################################
-        # Validate GitOps Structure
-        ####################################################################
-      - name: Validate GitOps Structure
+          {
+            echo "release-id=${RELEASE_ID}"
+            echo "development-status=${NEW_STATUS}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Development release verified."
+
+          echo "Release: ${RELEASE_ID}"
+
+          echo "Status : ${NEW_STATUS}"
+
+      - name: Validate Registry Change Scope
+
+        working-directory: gitops
+
+        shell: bash
+
         run: |
-            set -euo pipefail
 
-            FILE="deployment-manifest/deployment-manifest.json"
+          set -euo pipefail
 
-            jq -c '.images[]' "$FILE" | while read SERVICE; do
+          EXPECTED_FILE="${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
 
-            NAME=$(echo "$SERVICE" | jq -r '.service')
+          CHANGED_FILES=$(git diff --name-only)
 
-            VALUES_FILE="gitops/applications/${NAME}/development/values.yaml"
+          if [[ "${CHANGED_FILES}" != "${EXPECTED_FILE}" ]]; then
 
-            if [[ ! -f "$VALUES_FILE" ]]; then
-                echo "Missing GitOps configuration:"
-                echo "$VALUES_FILE"
-                exit 1
-            fi
+            echo "ERROR: Unexpected Release Registry changes."
 
-            echo "Validated ${NAME}"
+            echo "Expected:"
+            echo "${EXPECTED_FILE}"
 
-            done
+            echo "Actual:"
+            echo "${CHANGED_FILES}"
 
-        ####################################################################
-        # Update GitOps Manifests
-        ####################################################################
-      - name: Update GitOps Manifests
+            exit 1
+
+          fi
+
+          echo "Release Registry mutation scope validated."
+
+      - name: Verify Immutable Release Metadata
+
+        working-directory: gitops
+
+        shell: bash
+
         run: |
-            set -euo pipefail
 
-            FILE="deployment-manifest/deployment-manifest.json"
+          set -euo pipefail
 
-            jq -c '.images[]' "$FILE" | while read SERVICE; do
+          RELEASE_FILE="${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
 
-            NAME=$(echo "$SERVICE" | jq -r '.service')
-            REPOSITORY=$(echo "$SERVICE" | jq -r '.repository')
-            TAG=$(echo "$SERVICE" | jq -r '.tag')
-            DIGEST=$(echo "$SERVICE" | jq -r '.digest')
+          git show "HEAD:${RELEASE_FILE}" \
+            > /tmp/release-before.yaml
 
-            VALUES_FILE="gitops/applications/${NAME}/development/values.yaml"
+          yq -o=json '
 
-            echo "Updating ${NAME}"
+            {
+              "schemaVersion": .schemaVersion,
+              "release": .release,
+              "source": .source,
+              "ci": .ci,
+              "images": .images,
+              "staging": .promotion.staging,
+              "production": .promotion.production
+            }
 
-            RELEASE=$(jq -r '.releaseId' "$FILE")
+          ' /tmp/release-before.yaml \
+            > /tmp/immutable-before.json
 
-            yq -i "
-            .image.repository = \"${REPOSITORY}\" |
-            .image.tag = \"${TAG}\" |
-            .image.digest = \"${DIGEST}\" |
-            .release = \"${RELEASE}\"
-            " "$VALUES_FILE"
-            done
+          yq -o=json '
 
-        ####################################################################
-        # Create Release History
-        ####################################################################
-      ####################################################################
-# Create Release History
-####################################################################
-      - name: Create Release History
+            {
+              "schemaVersion": .schemaVersion,
+              "release": .release,
+              "source": .source,
+              "ci": .ci,
+              "images": .images,
+              "staging": .promotion.staging,
+              "production": .promotion.production
+            }
+
+          ' "${RELEASE_FILE}" \
+            > /tmp/immutable-after.json
+
+          if ! diff \
+            -u \
+            /tmp/immutable-before.json \
+            /tmp/immutable-after.json; then
+
+            echo "ERROR: Immutable release metadata changed."
+
+            exit 1
+
+          fi
+
+          echo "Immutable release metadata verified."
+
+      - name: Configure Git Identity
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit Development Verification
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          RELEASE_FILE="${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          git add -- "${RELEASE_FILE}"
+
+          if git diff --cached --quiet; then
+
+            echo "ERROR: No Development verification change staged."
+
+            exit 1
+
+          fi
+
+          git commit \
+            -m "release: verify dev ${RELEASE_ID}" \
+            -m "GitOps commit: ${GITOPS_COMMIT}" \
+            -m "Workflow run: ${{ github.run_id }}"
+
+      - name: Push Development Verification
+
+        id: push
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+
+          set -euo pipefail
+
+          git pull \
+            --rebase \
+            origin \
+            main
+
+          RELEASE_FILE="${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
+
+          FINAL_STATUS=$(
+
+            yq -r \
+              '.promotion.development.status' \
+              "${RELEASE_FILE}"
+
+          )
+
+          if [[ "${FINAL_STATUS}" != "verified" ]]; then
+
+            echo "ERROR: Development state changed during rebase."
+
+            exit 1
+
+          fi
+
+          git push \
+            origin \
+            HEAD:main
+
+          VERIFICATION_COMMIT=$(git rev-parse HEAD)
+
+          echo "verification-commit=${VERIFICATION_COMMIT}" \
+            >> "${GITHUB_OUTPUT}"
+
+          echo "Development verification pushed."
+
+          echo "Registry commit: ${VERIFICATION_COMMIT}"
+
+      - name: Verify Development Verification Record
+
+        working-directory: gitops
+
         env:
-            RELEASE_SHA: ${{ steps.release.outputs.RELEASE_SHA }}
+
+          VERIFICATION_COMMIT: ${{ steps.push.outputs.verification-commit }}
+
+        shell: bash
+
         run: |
-            set -euo pipefail
-            RELEASE=$(jq -r '.releaseId' deployment-manifest/deployment-manifest.json)
 
-            RELEASE_DIR="gitops/${RELEASES_PATH}/${RELEASE_SHA}"
+          set -euo pipefail
 
-            mkdir -p "${RELEASE_DIR}"
+          git fetch origin main
 
-            cp deployment-manifest/deployment-manifest.json \
-            "${RELEASE_DIR}/deployment-manifest.json"
+          if ! git merge-base \
+            --is-ancestor \
+            "${VERIFICATION_COMMIT}" \
+            "origin/main"; then
 
-            cat > "${RELEASE_DIR}/release.yaml" <<EOF
-            release: ${RELEASE_SHA}
-            environment: ${ENVIRONMENT}
-            createdBy: github-actions
-            workflowRun: ${GITHUB_RUN_ID}
-            createdAt: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            EOF
+            echo "ERROR: Verification record is not present on main."
 
-            echo "Release history created at ${RELEASE_DIR}"
+            exit 1
 
-        ####################################################################
-        # Commit GitOps Changes
-        ####################################################################
-      - name: Commit GitOps Changes
+          fi
+
+          echo "Development verification record confirmed."
+
+      - name: Write Final Development Summary
+
+        env:
+
+          VERIFICATION_COMMIT: ${{ steps.push.outputs.verification-commit }}
+
+        shell: bash
+
         run: |
-            set -euo pipefail
 
-            cd gitops
+          {
 
-            git config user.name "github-actions"
-            git config user.email "github-actions@github.com"
+            echo "# Development Release Verified"
 
-            git add .
+            echo ""
 
-            if git diff --cached --quiet; then
-            echo "No changes detected."
-            exit 0
-            fi
+            echo "| Attribute | Value |"
 
-            git commit -m "Deploy release ${{ steps.release.outputs.RELEASE_SHA }} to ${ENVIRONMENT}"
+            echo "|---|---|"
 
-            git push origin HEAD
+            echo "| Release | \`${RELEASE_ID}\` |"
+
+            echo "| GitOps Commit | \`${GITOPS_COMMIT}\` |"
+
+            echo "| Applications Verified | ${APPLICATIONS_VERIFIED} |"
+
+            echo "| Argo CD Sync | Passed |"
+
+            echo "| Argo CD Health | Passed |"
+
+            echo "| Development Status | **verified** |"
+
+            echo "| Verification Commit | \`${VERIFICATION_COMMIT}\` |"
+
+            echo "| Staging Eligibility | **Eligible** |"
+
+          } >> "${GITHUB_STEP_SUMMARY}"
