@@ -783,6 +783,8 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
           role-session-name: dev-release-${{ github.run_id }}
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Verify AWS Identity
 
