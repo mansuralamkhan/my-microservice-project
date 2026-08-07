@@ -208,6 +208,9 @@ jobs:
             ####################################################################
         # Validate Deployment Manifest
         ####################################################################
+      ####################################################################
+# Validate Deployment Manifest
+####################################################################
       - name: Validate Deployment Manifest
         run: |
             set -euo pipefail
@@ -216,17 +219,19 @@ jobs:
 
             jq empty "$FILE"
 
-            jq -e '.release' "$FILE" >/dev/null
-            jq -e '.services' "$FILE" >/dev/null
+            jq -e '.schemaVersion' "$FILE" >/dev/null
+            jq -e '.releaseId' "$FILE" >/dev/null
+            jq -e '.images' "$FILE" >/dev/null
 
-            COUNT=$(jq '.services | length' "$FILE")
+            COUNT=$(jq '.images | length' "$FILE")
 
             if [[ "$COUNT" -eq 0 ]]; then
-            echo "Deployment manifest contains no services."
+            echo "Deployment manifest contains no images."
             exit 1
             fi
 
-            echo "Found $COUNT service(s)."
+            echo "Release: $(jq -r '.releaseId' "$FILE")"
+            echo "Found $COUNT image(s)."
 
         ####################################################################
         # Validate GitOps Structure
@@ -237,7 +242,7 @@ jobs:
 
             FILE="deployment-manifest/deployment-manifest.json"
 
-            jq -c '.services[]' "$FILE" | while read SERVICE; do
+            jq -c '.images[]' "$FILE" | while read SERVICE; do
 
             NAME=$(echo "$SERVICE" | jq -r '.service')
 
@@ -262,7 +267,7 @@ jobs:
 
             FILE="deployment-manifest/deployment-manifest.json"
 
-            jq -c '.services[]' "$FILE" | while read SERVICE; do
+            jq -c '.images[]' "$FILE" | while read SERVICE; do
 
             NAME=$(echo "$SERVICE" | jq -r '.service')
             REPOSITORY=$(echo "$SERVICE" | jq -r '.repository')
@@ -292,6 +297,7 @@ jobs:
             RELEASE_SHA: ${{ steps.release.outputs.RELEASE_SHA }}
         run: |
             set -euo pipefail
+            Unexpected value 'RELEASE=$(jq -r '.releaseId' deployment-manifest/deployment-manifest.json)'
 
             RELEASE_DIR="gitops/${RELEASES_PATH}/${RELEASE_SHA}"
 
