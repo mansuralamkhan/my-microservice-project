@@ -1,0 +1,205 @@
+name: Deploy to Development
+
+on:
+
+  # Automatic deployment after CI succeeds
+  workflow_run:
+    workflows:
+      - CI Pipeline
+    types:
+      - completed
+
+  # Manual deployment
+  workflow_dispatch:
+
+    inputs:
+
+      release_sha:
+        description: "Release SHA to deploy (optional)"
+        required: false
+        type: string
+
+      simulate_result:
+        description: "Deployment result"
+
+        required: true
+
+        default: success
+
+        type: choice
+
+        options:
+          - success
+          - partial_failure
+          - failure
+
+permissions:
+
+  contents: write
+
+  actions: read
+
+  id-token: write
+
+concurrency:
+
+  group: deploy-development
+
+  cancel-in-progress: false
+
+env:
+
+  ENVIRONMENT: development
+
+  GITOPS_REPOSITORY: mansuralamkhan/my-gitops
+
+  RELEASES_PATH: releases
+
+  ENVIRONMENT_FILE: environments/development.yaml
+
+  HISTORY_PATH: deployment-history/development
+
+
+jobs:
+  deploy:
+    name: Deploy Development
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      actions: read
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      GITOPS_REPOSITORY: mansuralamkhan/gitops-infrastructure-microservice
+      ENVIRONMENT_FILE: environments/development.yaml
+
+    steps:
+      ####################################################################
+      # Checkout Application Repository
+      ####################################################################
+      - name: Checkout Application Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      ####################################################################
+      # Resolve Release SHA
+      ####################################################################
+      - name: Resolve Release
+        id: release
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+
+            RELEASE_SHA="${{ inputs.release_sha }}"
+
+            if [[ -z "${RELEASE_SHA}" ]]; then
+              echo "Release SHA is required."
+              exit 1
+            fi
+
+            echo "CI_RUN_ID=" >> "$GITHUB_OUTPUT"
+
+          else
+
+            RELEASE_SHA="${{ github.event.workflow_run.head_sha }}"
+            CI_RUN_ID="${{ github.event.workflow_run.id }}"
+
+            echo "CI_RUN_ID=${CI_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+          fi
+
+          echo "RELEASE_SHA=${RELEASE_SHA}" >> "$GITHUB_OUTPUT"
+
+          echo "Deploying Release: ${RELEASE_SHA}"
+
+      ####################################################################
+      # Download Deployment Contract
+      ####################################################################
+      - name: Download Deployment Contract
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-contract
+          run-id: ${{ steps.release.outputs.CI_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: deployment
+
+      ####################################################################
+      # Validate Deployment Contract
+      ####################################################################
+      - name: Validate Deployment Contract
+        run: |
+          set -euo pipefail
+
+          test -f deployment/deployment-manifest.json
+          test -f deployment/release.yaml
+
+          echo "Deployment contract verified."
+
+      ####################################################################
+      # Checkout GitOps Repository
+      ####################################################################
+      - name: Checkout GitOps Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPOSITORY }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+          fetch-depth: 1
+
+      ####################################################################
+      # Validate Environment File
+      ####################################################################
+      - name: Validate Environment File
+        run: |
+          set -euo pipefail
+
+          FILE="gitops/${ENVIRONMENT_FILE}"
+
+          if [[ ! -f "$FILE" ]]; then
+            echo "Environment file not found: $FILE"
+            exit 1
+          fi
+
+      ####################################################################
+      # Read Current Environment State
+      ####################################################################
+      - name: Read Environment State
+        id: environment
+        run: |
+          set -euo pipefail
+
+          FILE="gitops/${ENVIRONMENT_FILE}"
+
+          CURRENT_RELEASE=$(yq '.currentRelease' "$FILE")
+
+          echo "Current Release: ${CURRENT_RELEASE}"
+
+          echo "current=${CURRENT_RELEASE}" >> "$GITHUB_OUTPUT"
+          echo "rollback=${CURRENT_RELEASE}" >> "$GITHUB_OUTPUT"
+
+      ####################################################################
+      # Update Desired Release
+      ####################################################################
+      - name: Set Desired Release
+        env:
+          RELEASE_SHA: ${{ steps.release.outputs.RELEASE_SHA }}
+        run: |
+          set -euo pipefail
+
+          FILE="gitops/${ENVIRONMENT_FILE}"
+
+          yq -i '
+            .desiredRelease = strenv(RELEASE_SHA) |
+            .status = "deploying"
+          ' "$FILE"
+
+          echo "Desired Release Updated"
+
+          cat "$FILE"
