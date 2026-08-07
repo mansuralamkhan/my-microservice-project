@@ -246,7 +246,7 @@ jobs:
 
             NAME=$(echo "$SERVICE" | jq -r '.service')
 
-            VALUES_FILE="gitops/applications/${NAME}/environments/dev/values.yaml"
+            VALUES_FILE="gitops/applications/${NAME}/development/values.yaml"
 
             if [[ ! -f "$VALUES_FILE" ]]; then
                 echo "Missing GitOps configuration:"
@@ -274,7 +274,7 @@ jobs:
             TAG=$(echo "$SERVICE" | jq -r '.tag')
             DIGEST=$(echo "$SERVICE" | jq -r '.digest')
 
-            VALUES_FILE="gitops/applications/${NAME}/environments/dev/values.yaml"
+            VALUES_FILE="gitops/applications/${NAME}/development/values.yaml"
 
             echo "Updating ${NAME}"
 
