@@ -656,14 +656,14 @@ jobs:
 
     timeout-minutes: 20
 
-    environment:
-      name: development
+    # environment:
+    #   name: development
 
     env:
 
       AWS_REGION: ${{ vars.AWS_REGION }}
 
-      AWS_ROLE_ARN: ${{ vars.DEV_AWS_ROLE_ARN }}
+      AWS_ROLE_ARN: ${{ vars.WS_ROLE_ARN }}
 
       RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
 
@@ -1185,8 +1185,8 @@ jobs:
 
     timeout-minutes: 15
 
-    environment:
-      name: development
+    # environment:
+    #   name: development
 
     env:
 
@@ -1846,8 +1846,8 @@ jobs:
 
     timeout-minutes: 10
 
-    environment:
-      name: development
+    # environment:
+    #   name: development
 
     env:
 
@@ -2573,8 +2573,8 @@ jobs:
 
     timeout-minutes: 30
 
-    environment:
-      name: development
+    # environment:
+    #   name: development
 
     env:
 
@@ -2954,8 +2954,8 @@ jobs:
 
     timeout-minutes: 10
 
-    environment:
-      name: development
+    # environment:
+    #   name: development
 
     env:
 
