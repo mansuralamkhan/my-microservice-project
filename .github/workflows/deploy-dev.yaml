@@ -51,7 +51,7 @@ env:
 
   ENVIRONMENT: development
 
-  GITOPS_REPOSITORY: mansuralamkhan/my-gitops
+  GITOPS_REPOSITORY: mansuralamkhan/gitops-infrastructure-microservice
 
   RELEASES_PATH: releases
 
