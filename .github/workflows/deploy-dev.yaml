@@ -1060,7 +1060,7 @@ jobs:
             --output text)
             ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-            IMAGE_REFERENCE="${ECR_REPOSITORY}/${REPOSITORY}@${DIGEST}"
+            IMAGE_REFERENCE="${ECR_REGISTRY}/${REPOSITORY}@${DIGEST}"
 
             echo ""
 
