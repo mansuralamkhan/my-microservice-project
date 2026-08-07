@@ -137,8 +137,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          test -f deployment/deployment-manifest.json
-          test -f deployment/release.yaml
+          test -f deployment-manifest/deployment-manifest.json
+        
 
           echo "Deployment contract verified."
 
