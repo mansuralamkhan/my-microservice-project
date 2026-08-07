@@ -278,12 +278,14 @@ jobs:
 
             echo "Updating ${NAME}"
 
-            yq -i "
-                .image.repository = \"${REPOSITORY}\" |
-                .image.tag = \"${TAG}\" |
-                .image.digest = \"${DIGEST}\"
-            " "$VALUES_FILE"
+            RELEASE=$(jq -r '.releaseId' "$FILE")
 
+            yq -i "
+            .image.repository = \"${REPOSITORY}\" |
+            .image.tag = \"${TAG}\" |
+            .image.digest = \"${DIGEST}\" |
+            .release = \"${RELEASE}\"
+            " "$VALUES_FILE"
             done
 
         ####################################################################
