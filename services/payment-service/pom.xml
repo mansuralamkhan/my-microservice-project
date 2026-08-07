@@ -12,7 +12,7 @@
     <maven.compiler.target>17</maven.compiler.target>
     <spotless.version>2.37.0</spotless.version>
     <jacoco.version>0.8.10</jacoco.version>
-    <google-java-format.version>1.15.0</google-java-format.version>
+    <google-java-format.version>1.17.0</google-java-format.version>
   </properties>
 
   <dependencies>
