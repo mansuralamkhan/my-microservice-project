@@ -629,7 +629,7 @@ jobs:
 
       - name: Scan Docker Image with Trivy
 
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@57a97c7d9834571f54e1fb0cf13783c5185d26ff
 
         with:
 
