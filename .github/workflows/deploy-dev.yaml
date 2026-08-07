@@ -128,7 +128,7 @@ jobs:
           name: deployment-manifest
           run-id: ${{ steps.release.outputs.CI_RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: deployment-manifest.json
+          path: deployment-manifest
 
       ####################################################################
       # Validate Deployment Contract
