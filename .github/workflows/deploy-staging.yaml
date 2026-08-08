@@ -2094,7 +2094,7 @@ jobs:
 #             echo "| Smoke Test | ${SMOKE_TEST_STATUS} |"
 #             echo "| Result | **Staging deployment verified** |"
 #           } >> "${GITHUB_STEP_SUMMARY}"
-   verify-staging-deployment:
+  verify-staging-deployment:
  
     name: Verify Staging Deployment (SIMULATED)
  
