@@ -1191,7 +1191,9 @@ jobs:
 
           set -euo pipefail
 
-          git add -- 'applications/*/environments/staging/values.yaml'
+          git add -- \
+            'applications/*/environments/staging/values.yaml' \
+            'environments/staging.yaml'
 
           if git diff --cached --quiet; then
             echo "ERROR: No Staging GitOps changes were staged."
