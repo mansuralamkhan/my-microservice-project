@@ -654,12 +654,13 @@ jobs:
             echo "Tag        : ${TAG}"
             echo "Digest     : ${DIGEST}"
 
-            if [[ "${REPOSITORY}" != */* ]]; then
-              echo "ERROR: Invalid ECR repository URI for ${SERVICE}."
-              exit 1
-            fi
+            # if [[ "${REPOSITORY}" != */* ]]; then
+            #   echo "ERROR: Invalid ECR repository URI for ${SERVICE}."
+            #   exit 1
+            # fi
 
-            ECR_REPOSITORY="${REPOSITORY#*/}"
+            # ECR_REPOSITORY="${REPOSITORY#*/}"
+             ECR_REPOSITORY="${REPOSITORY}"
 
             if [[ -z "${ECR_REPOSITORY}" ]]; then
               echo "ERROR: Unable to determine ECR repository for ${SERVICE}."
@@ -686,8 +687,14 @@ jobs:
             fi
 
             echo "ECR digest verified."
+            AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+            --query Account \
+            --output text)
+            ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-            IMAGE_REFERENCE="${REPOSITORY}@${DIGEST}"
+            # IMAGE_REFERENCE="${REPOSITORY}@${DIGEST}"
+            IMAGE_REFERENCE="${ECR_REGISTRY}/${REPOSITORY}@${DIGEST}"
+
 
             echo ""
             echo "Verifying Cosign signature..."
