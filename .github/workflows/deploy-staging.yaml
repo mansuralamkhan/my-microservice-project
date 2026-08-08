@@ -1,4 +1,4 @@
-name: Staging Release Promotion
+name: Production Release Promotion
 
 on:
 
@@ -8,7 +8,7 @@ on:
 
       release-id:
 
-        description: "Immutable release ID to promote from verified Development to Staging"
+        description: "Immutable release ID to promote from verified Staging to Production"
 
         required: true
 
@@ -24,7 +24,7 @@ permissions:
 
 concurrency:
 
-  group: staging-release-promotion
+  group: production-release-promotion
 
   cancel-in-progress: false
 
@@ -58,7 +58,7 @@ jobs:
 
     steps:
 
-      - name: Validate Staging Promotion Request
+      - name: Validate Production Promotion Request
 
         env:
 
@@ -75,7 +75,7 @@ jobs:
             exit 1
           fi
 
-          echo "Requested Staging release: ${REQUESTED_RELEASE_ID}"
+          echo "Requested Production release: ${REQUESTED_RELEASE_ID}"
 
       - name: Validate Release Registry Configuration
 
@@ -301,7 +301,7 @@ jobs:
           DEV_STATUS=$(yq -r '.promotion.development.status' "${RELEASE_FILE}")
 
           if [[ "${DEV_STATUS}" != "verified" ]]; then
-            echo "ERROR: Release is not eligible for Staging."
+            echo "ERROR: Release is not verified in Development."
             echo "Required Development status: verified"
             echo "Actual Development status  : ${DEV_STATUS}"
             exit 1
@@ -309,9 +309,18 @@ jobs:
 
           STAGING_STATUS=$(yq -r '.promotion.staging.status' "${RELEASE_FILE}")
 
-          if [[ "${STAGING_STATUS}" != "pending" ]]; then
-            echo "ERROR: Release is not eligible for initial Staging promotion."
-            echo "Current Staging status: ${STAGING_STATUS}"
+          if [[ "${STAGING_STATUS}" != "verified" ]]; then
+            echo "ERROR: Release is not verified in Staging."
+            echo "Required Staging status: verified"
+            echo "Actual Staging status  : ${STAGING_STATUS}"
+            exit 1
+          fi
+
+          PRODUCTION_STATUS=$(yq -r '.promotion.production.status' "${RELEASE_FILE}")
+
+          if [[ "${PRODUCTION_STATUS}" != "pending" ]]; then
+            echo "ERROR: Release is not eligible for initial Production promotion."
+            echo "Current Production status: ${PRODUCTION_STATUS}"
             exit 1
           fi
 
@@ -374,7 +383,7 @@ jobs:
         run: |
 
           {
-            echo "## Staging Release Resolution"
+            echo "## Production Release Resolution"
             echo ""
             echo "| Attribute | Value |"
             echo "|---|---|"
@@ -384,7 +393,7 @@ jobs:
             echo "| CI Run ID | \`${CI_RUN_ID}\` |"
             echo "| Registry Commit | \`${REGISTRY_COMMIT}\` |"
             echo "| Release Status | Registered / Validated |"
-            echo "| Staging Promotion | Eligible |"
+            echo "| Production Promotion | Eligible |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
   verify-release-artifacts:
@@ -398,9 +407,6 @@ jobs:
 
     timeout-minutes: 20
 
-    # environment:
-    #   name: staging
-
     env:
 
       AWS_REGION: ${{ vars.AWS_REGION }}
@@ -410,8 +416,6 @@ jobs:
       RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
 
       REGISTRY_COMMIT: ${{ needs.resolve-release.outputs.release-registry-commit }}
-
-   
 
     outputs:
 
@@ -457,7 +461,7 @@ jobs:
           fi
 
           if [[ -z "${AWS_ROLE_ARN}" ]]; then
-            echo "ERROR: STAGING_AWS_ROLE_ARN is not configured."
+            echo "ERROR: AWS_ROLE_ARN is not configured."
             exit 1
           fi
 
@@ -510,7 +514,8 @@ jobs:
 
           aws-region: ${{ env.AWS_REGION }}
 
-          role-session-name: staging-release-${{ github.run_id }}
+          role-session-name: production-release-${{ github.run_id }}
+
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
@@ -654,13 +659,7 @@ jobs:
             echo "Tag        : ${TAG}"
             echo "Digest     : ${DIGEST}"
 
-            # if [[ "${REPOSITORY}" != */* ]]; then
-            #   echo "ERROR: Invalid ECR repository URI for ${SERVICE}."
-            #   exit 1
-            # fi
-
-            # ECR_REPOSITORY="${REPOSITORY#*/}"
-             ECR_REPOSITORY="${REPOSITORY}"
+            ECR_REPOSITORY="${REPOSITORY}"
 
             if [[ -z "${ECR_REPOSITORY}" ]]; then
               echo "ERROR: Unable to determine ECR repository for ${SERVICE}."
@@ -687,14 +686,14 @@ jobs:
             fi
 
             echo "ECR digest verified."
+
             AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
-            --query Account \
-            --output text)
+              --query Account \
+              --output text)
+
             ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-            # IMAGE_REFERENCE="${REPOSITORY}@${DIGEST}"
             IMAGE_REFERENCE="${ECR_REGISTRY}/${REPOSITORY}@${DIGEST}"
-
 
             echo ""
             echo "Verifying Cosign signature..."
@@ -760,7 +759,7 @@ jobs:
         run: |
 
           {
-            echo "## Staging Release Artifact Verification"
+            echo "## Production Release Artifact Verification"
             echo ""
             echo "| Attribute | Value |"
             echo "|---|---|"
@@ -774,9 +773,21 @@ jobs:
             echo "| Result | **Release artifacts trusted** |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-  update-staging-gitops:
+  # -----------------------------------------------------------------
+  # MANUAL APPROVAL GATE
+  #
+  # This job (and record-production-promotion / record-production-
+  # verification below) declares `environment: name: production`.
+  # GitHub Actions Environment protection rules provide the manual
+  # approval: in repo Settings > Environments > production, configure
+  # "Required reviewers" with the people/teams who must approve before
+  # this job is allowed to run. The workflow run will pause here and
+  # wait for one of those reviewers to approve in the Actions UI.
+  # No custom approval logic is needed in the workflow itself.
+  # -----------------------------------------------------------------
+  update-production-gitops:
 
-    name: Update Staging GitOps
+    name: Update Production GitOps
 
     needs:
       - resolve-release
@@ -787,7 +798,7 @@ jobs:
     timeout-minutes: 15
 
     environment:
-      name: staging
+      name: production
 
     env:
 
@@ -795,7 +806,6 @@ jobs:
 
       REGISTRY_COMMIT: ${{ needs.resolve-release.outputs.release-registry-commit }}
 
-  
       GITOPS_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
 
     outputs:
@@ -823,7 +833,7 @@ jobs:
           set -euo pipefail
 
           echo "=========================================="
-          echo "Validating Staging GitOps promotion inputs"
+          echo "Validating Production GitOps promotion inputs"
           echo "=========================================="
           echo "Resolved Release : ${RELEASE_ID}"
           echo "Verified Release : ${VERIFIED_RELEASE_ID}"
@@ -857,7 +867,7 @@ jobs:
             exit 1
           fi
 
-          echo "Staging GitOps promotion inputs are valid."
+          echo "Production GitOps promotion inputs are valid."
 
       - name: Checkout Writable GitOps Repository
 
@@ -942,22 +952,22 @@ jobs:
 
           STAGING_STATUS=$(yq -r '.promotion.staging.status' "${RELEASE_FILE}")
 
-          DEV_STATUS=$(yq -r '.promotion.development.status' "${RELEASE_FILE}")
-
-          if [[ "${DEV_STATUS}" != "verified" ]]; then
-            echo "ERROR: Development deployment is not verified."
+          if [[ "${STAGING_STATUS}" != "verified" ]]; then
+            echo "ERROR: Staging deployment is not verified."
             exit 1
           fi
 
-          if [[ "${STAGING_STATUS}" != "pending" ]]; then
-            echo "ERROR: Release is no longer eligible for Staging promotion."
-            echo "Staging status: ${STAGING_STATUS}"
+          PRODUCTION_STATUS=$(yq -r '.promotion.production.status' "${RELEASE_FILE}")
+
+          if [[ "${PRODUCTION_STATUS}" != "pending" ]]; then
+            echo "ERROR: Release is no longer eligible for Production promotion."
+            echo "Production status: ${PRODUCTION_STATUS}"
             exit 1
           fi
 
           echo "Verified Release Registry snapshot is valid."
 
-      - name: Promote Release to Staging Desired State
+      - name: Promote Release to Production Desired State
 
         id: promote
 
@@ -976,7 +986,7 @@ jobs:
           UPDATED_COUNT=0
 
           echo "=========================================="
-          echo "Updating Staging GitOps desired state"
+          echo "Updating Production GitOps desired state"
           echo "=========================================="
           echo "Release: ${RELEASE_ID}"
           echo ""
@@ -991,7 +1001,7 @@ jobs:
             TAG=$(SERVICE="${SERVICE}" yq -r '.images[strenv(SERVICE)].tag' "${RELEASE_FILE}")
             DIGEST=$(SERVICE="${SERVICE}" yq -r '.images[strenv(SERVICE)].digest' "${RELEASE_FILE}")
 
-            VALUES_FILE="gitops/applications/${SERVICE}/environments/staging/values.yaml"
+            VALUES_FILE="gitops/applications/${SERVICE}/environments/production/values.yaml"
 
             if [[ -z "${REPOSITORY}" || "${REPOSITORY}" == "null" ]]; then
               echo "ERROR: Repository missing for ${SERVICE}."
@@ -1004,7 +1014,7 @@ jobs:
             fi
 
             if [[ ! -f "${VALUES_FILE}" ]]; then
-              echo "ERROR: Staging values file does not exist."
+              echo "ERROR: Production values file does not exist."
               echo "Expected: ${VALUES_FILE}"
               exit 1
             fi
@@ -1064,7 +1074,7 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
           echo "=========================================="
-          echo "STAGING DESIRED STATE UPDATE COMPLETE"
+          echo "PRODUCTION DESIRED STATE UPDATE COMPLETE"
           echo "=========================================="
           echo "Release          : ${RELEASE_ID}"
           echo "Services updated : ${UPDATED_COUNT}"
@@ -1087,7 +1097,7 @@ jobs:
 
           echo ""
 
-          git diff -- 'applications/*/environments/staging/values.yaml'
+          git diff -- 'applications/*/environments/production/values.yaml'
 
       - name: Validate GitOps Change Scope
 
@@ -1103,7 +1113,7 @@ jobs:
 
           if [[ -z "${CHANGED_FILES}" ]]; then
             echo "ERROR: Promotion produced no GitOps changes."
-            echo "The requested release may already be configured in Staging."
+            echo "The requested release may already be configured in Production."
             exit 1
           fi
 
@@ -1113,7 +1123,7 @@ jobs:
           do
             [[ -z "${FILE}" ]] && continue
 
-            if [[ "${FILE}" =~ ^applications/[^/]+/environments/staging/values\.yaml$ ]]; then
+            if [[ "${FILE}" =~ ^applications/[^/]+/environments/production/values\.yaml$ ]]; then
               echo "Allowed change: ${FILE}"
             else
               echo "ERROR: Unauthorized GitOps change detected: ${FILE}"
@@ -1142,7 +1152,7 @@ jobs:
 
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Commit Staging Promotion
+      - name: Commit Production Promotion
 
         id: commit
 
@@ -1158,20 +1168,21 @@ jobs:
 
           set -euo pipefail
 
-          git add -- 'applications/*/environments/staging/values.yaml'
+          git add -- 'applications/*/environments/production/values.yaml'
 
           if git diff --cached --quiet; then
-            echo "ERROR: No Staging GitOps changes were staged."
+            echo "ERROR: No Production GitOps changes were staged."
             exit 1
           fi
 
           git commit \
-            -m "deploy(staging): promote release ${RELEASE_ID}" \
-            -m "Source CI run: ${CI_RUN_ID}"
+            -m "deploy(production): promote release ${RELEASE_ID}" \
+            -m "Source CI run: ${CI_RUN_ID}" \
+            -m "Approved by: ${{ github.actor }}"
 
           echo "Created local GitOps commit: $(git rev-parse HEAD)"
 
-      - name: Push Staging Promotion
+      - name: Push Production Promotion
 
         id: push
 
@@ -1187,7 +1198,7 @@ jobs:
 
           git pull --rebase origin main
 
-          echo "Pushing Staging promotion..."
+          echo "Pushing Production promotion..."
 
           git push origin HEAD:main
 
@@ -1195,7 +1206,7 @@ jobs:
 
           echo "gitops-commit=${GITOPS_COMMIT}" >> "${GITHUB_OUTPUT}"
 
-          echo "Staging GitOps promotion pushed successfully."
+          echo "Production GitOps promotion pushed successfully."
           echo "Final GitOps commit: ${GITOPS_COMMIT}"
 
       - name: Verify GitOps Push
@@ -1215,7 +1226,7 @@ jobs:
           git fetch origin main
 
           if ! git merge-base --is-ancestor "${EXPECTED_COMMIT}" "origin/main"; then
-            echo "ERROR: Staging promotion commit is not present on GitOps main."
+            echo "ERROR: Production promotion commit is not present on GitOps main."
             echo "Expected commit: ${EXPECTED_COMMIT}"
             exit 1
           fi
@@ -1238,7 +1249,7 @@ jobs:
         run: |
 
           {
-            echo "## Staging GitOps Promotion"
+            echo "## Production GitOps Promotion"
             echo ""
             echo "| Attribute | Value |"
             echo "|---|---|"
@@ -1246,26 +1257,27 @@ jobs:
             echo "| Source Commit | \`${SOURCE_COMMIT}\` |"
             echo "| GitOps Commit | \`${GITOPS_COMMIT}\` |"
             echo "| Services Updated | ${SERVICES_UPDATED} |"
+            echo "| Approved By | ${{ github.actor }} |"
             echo "| Desired State | Updated |"
             echo "| ArgoCD Deployment | Not yet verified |"
-            echo "| Promotion State | Pending Job 4 recording |"
+            echo "| Promotion State | Pending recording |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-  record-staging-promotion:
+  record-production-promotion:
 
-    name: Record Staging Promotion
+    name: Record Production Promotion
 
     needs:
       - resolve-release
       - verify-release-artifacts
-      - update-staging-gitops
+      - update-production-gitops
 
     runs-on: ubuntu-latest
 
     timeout-minutes: 10
 
     environment:
-      name: staging
+      name: production
 
     env:
 
@@ -1275,13 +1287,11 @@ jobs:
 
       CI_RUN_ID: ${{ needs.resolve-release.outputs.ci-run-id }}
 
-      GITOPS_COMMIT: ${{ needs.update-staging-gitops.outputs.gitops-commit }}
+      GITOPS_COMMIT: ${{ needs.update-production-gitops.outputs.gitops-commit }}
 
-      SERVICES_UPDATED: ${{ needs.update-staging-gitops.outputs.services-updated }}
+      SERVICES_UPDATED: ${{ needs.update-production-gitops.outputs.services-updated }}
 
       GITOPS_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
-
-  
 
     outputs:
 
@@ -1301,7 +1311,7 @@ jobs:
 
           VERIFIED_IMAGE_COUNT: ${{ needs.verify-release-artifacts.outputs.image-count }}
 
-          GITOPS_RELEASE_ID: ${{ needs.update-staging-gitops.outputs.release-id }}
+          GITOPS_RELEASE_ID: ${{ needs.update-production-gitops.outputs.release-id }}
 
         shell: bash
 
@@ -1310,7 +1320,7 @@ jobs:
           set -euo pipefail
 
           echo "=========================================="
-          echo "Validating Staging promotion evidence"
+          echo "Validating Production promotion evidence"
           echo "=========================================="
           echo "Release ID       : ${RELEASE_ID}"
           echo "Source Commit    : ${SOURCE_COMMIT}"
@@ -1365,7 +1375,7 @@ jobs:
             exit 1
           fi
 
-          echo "Staging promotion evidence is valid."
+          echo "Production promotion evidence is valid."
 
       - name: Checkout Release Registry
 
@@ -1424,7 +1434,7 @@ jobs:
           REGISTERED_SOURCE_COMMIT=$(yq -r '.source.commit' "${RELEASE_FILE}")
           REGISTERED_CI_RUN_ID=$(yq -r '.ci.runId' "${RELEASE_FILE}")
           CI_STATUS=$(yq -r '.ci.status' "${RELEASE_FILE}")
-          CURRENT_STAGING_STATUS=$(yq -r '.promotion.staging.status' "${RELEASE_FILE}")
+          CURRENT_PRODUCTION_STATUS=$(yq -r '.promotion.production.status' "${RELEASE_FILE}")
 
           if [[ "${REGISTERED_RELEASE_ID}" != "${RELEASE_ID}" ]]; then
             echo "ERROR: Release Registry identity mismatch."
@@ -1446,17 +1456,17 @@ jobs:
             exit 1
           fi
 
-          if [[ "${CURRENT_STAGING_STATUS}" != "pending" ]]; then
-            echo "ERROR: Invalid Staging promotion transition."
+          if [[ "${CURRENT_PRODUCTION_STATUS}" != "pending" ]]; then
+            echo "ERROR: Invalid Production promotion transition."
             echo "Expected current state: pending"
-            echo "Actual current state  : ${CURRENT_STAGING_STATUS}"
+            echo "Actual current state  : ${CURRENT_PRODUCTION_STATUS}"
             exit 1
           fi
 
           echo "Current Release Registry state is valid."
           echo "Allowed transition: pending -> gitops-updated"
 
-      - name: Verify Staging GitOps Commit
+      - name: Verify Production GitOps Commit
 
         working-directory: gitops
 
@@ -1483,7 +1493,7 @@ jobs:
           echo "GitOps promotion commit verified."
           echo "Commit: ${GITOPS_COMMIT}"
 
-      - name: Record Staging Promotion
+      - name: Record Production Promotion
 
         id: record
 
@@ -1513,20 +1523,21 @@ jobs:
           export ACTOR
 
           yq -i '
-            .promotion.staging.status = "gitops-updated" |
-            .promotion.staging.updatedAt = strenv(UPDATED_AT) |
-            .promotion.staging.gitopsCommit = strenv(GITOPS_COMMIT) |
-            .promotion.staging.workflowRunId = strenv(DEPLOY_WORKFLOW_RUN_ID) |
-            .promotion.staging.workflowRunAttempt = strenv(DEPLOY_WORKFLOW_RUN_ATTEMPT) |
-            .promotion.staging.servicesUpdated = (strenv(SERVICES_UPDATED) | tonumber) |
-            .promotion.staging.actor = strenv(ACTOR)
+            .promotion.production.eligible = true |
+            .promotion.production.status = "gitops-updated" |
+            .promotion.production.updatedAt = strenv(UPDATED_AT) |
+            .promotion.production.gitopsCommit = strenv(GITOPS_COMMIT) |
+            .promotion.production.workflowRunId = strenv(DEPLOY_WORKFLOW_RUN_ID) |
+            .promotion.production.workflowRunAttempt = strenv(DEPLOY_WORKFLOW_RUN_ATTEMPT) |
+            .promotion.production.servicesUpdated = (strenv(SERVICES_UPDATED) | tonumber) |
+            .promotion.production.actor = strenv(ACTOR)
           ' "${RELEASE_FILE}"
 
-          NEW_STATUS=$(yq -r '.promotion.staging.status' "${RELEASE_FILE}")
-          RECORDED_GITOPS_COMMIT=$(yq -r '.promotion.staging.gitopsCommit' "${RELEASE_FILE}")
+          NEW_STATUS=$(yq -r '.promotion.production.status' "${RELEASE_FILE}")
+          RECORDED_GITOPS_COMMIT=$(yq -r '.promotion.production.gitopsCommit' "${RELEASE_FILE}")
 
           if [[ "${NEW_STATUS}" != "gitops-updated" ]]; then
-            echo "ERROR: Failed to update Staging promotion status."
+            echo "ERROR: Failed to update Production promotion status."
             exit 1
           fi
 
@@ -1540,7 +1551,7 @@ jobs:
             echo "promotion-status=${NEW_STATUS}"
           } >> "${GITHUB_OUTPUT}"
 
-          echo "Staging promotion metadata updated."
+          echo "Production promotion metadata updated."
           echo "Status       : ${NEW_STATUS}"
           echo "Updated At   : ${UPDATED_AT}"
           echo "GitOps Commit: ${GITOPS_COMMIT}"
@@ -1605,7 +1616,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "production": .promotion.production
+              "staging": .promotion.staging
             }
           ' /tmp/release-before.yaml > /tmp/immutable-before.json
 
@@ -1617,7 +1628,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "production": .promotion.production
+              "staging": .promotion.staging
             }
           ' "${RELEASE_FILE}" > /tmp/immutable-after.json
 
@@ -1642,7 +1653,7 @@ jobs:
 
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Commit Staging Promotion State
+      - name: Commit Production Promotion State
 
         working-directory: gitops
 
@@ -1662,11 +1673,12 @@ jobs:
           fi
 
           git commit \
-            -m "release: record staging promotion ${RELEASE_ID}" \
+            -m "release: record production promotion ${RELEASE_ID}" \
             -m "GitOps commit: ${GITOPS_COMMIT}" \
-            -m "Workflow run: ${{ github.run_id }}"
+            -m "Workflow run: ${{ github.run_id }}" \
+            -m "Approved by: ${{ github.actor }}"
 
-      - name: Push Staging Promotion State
+      - name: Push Production Promotion State
 
         id: push
 
@@ -1682,11 +1694,11 @@ jobs:
 
           RELEASE_FILE="${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
 
-          FINAL_STATUS=$(yq -r '.promotion.staging.status' "${RELEASE_FILE}")
-          FINAL_GITOPS_COMMIT=$(yq -r '.promotion.staging.gitopsCommit' "${RELEASE_FILE}")
+          FINAL_STATUS=$(yq -r '.promotion.production.status' "${RELEASE_FILE}")
+          FINAL_GITOPS_COMMIT=$(yq -r '.promotion.production.gitopsCommit' "${RELEASE_FILE}")
 
           if [[ "${FINAL_STATUS}" != "gitops-updated" ]]; then
-            echo "ERROR: Staging promotion state changed during rebase."
+            echo "ERROR: Production promotion state changed during rebase."
             exit 1
           fi
 
@@ -1701,7 +1713,7 @@ jobs:
 
           echo "promotion-commit=${PROMOTION_COMMIT}" >> "${GITHUB_OUTPUT}"
 
-          echo "Staging promotion state pushed."
+          echo "Production promotion state pushed."
           echo "Registry commit: ${PROMOTION_COMMIT}"
 
       - name: Verify Promotion Record
@@ -1728,7 +1740,7 @@ jobs:
           echo "Promotion record confirmed on remote main."
           echo "Commit: ${PROMOTION_COMMIT}"
 
-      - name: Write Staging Promotion Summary
+      - name: Write Production Promotion Summary
 
         env:
 
@@ -1741,7 +1753,7 @@ jobs:
         run: |
 
           {
-            echo "## Staging Release Promotion"
+            echo "## Production Release Promotion"
             echo ""
             echo "| Attribute | Value |"
             echo "|---|---|"
@@ -1755,535 +1767,196 @@ jobs:
             echo "| ArgoCD Health | Not yet verified |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-#   verify-staging-deployment:
+  verify-production-deployment:
 
-#     name: Verify Staging Deployment
+    name: Verify Production Deployment (SIMULATED)
 
-#     needs:
-#       - resolve-release
-#       - verify-release-artifacts
-#       - update-staging-gitops
-#       - record-staging-promotion
-
-#     runs-on: ubuntu-latest
-
-#     timeout-minutes: 30
-
-#     environment:
-#       name: staging
-
-#     env:
-
-#       RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
-
-#       GITOPS_COMMIT: ${{ needs.update-staging-gitops.outputs.gitops-commit }}
-
-
-#       ARGOCD_SERVER: ${{ vars.ARGOCD_SERVER }}
-
-#       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
-
-#       STAGING_BASE_URL: ${{ vars.STAGING_BASE_URL }}
-
-#     outputs:
-
-#       release-id: ${{ steps.verify.outputs.release-id }}
-
-#       applications-verified: ${{ steps.verify.outputs.applications-verified }}
-
-#       smoke-test-status: ${{ steps.smoke.outputs.status }}
-
-#     steps:
-
-#       - name: Validate Verification Inputs
-
-#         env:
-
-#           PROMOTION_STATUS: ${{ needs.record-staging-promotion.outputs.promotion-status }}
-
-#           PROMOTED_RELEASE_ID: ${{ needs.record-staging-promotion.outputs.release-id }}
-
-#         shell: bash
-
-#         run: |
-
-#           set -euo pipefail
-
-#           if [[ "${PROMOTED_RELEASE_ID}" != "${RELEASE_ID}" ]]; then
-#             echo "ERROR: Promotion release mismatch."
-#             exit 1
-#           fi
-
-#           if [[ "${PROMOTION_STATUS}" != "gitops-updated" ]]; then
-#             echo "ERROR: Release has not reached gitops-updated."
-#             exit 1
-#           fi
-
-#           if [[ ! "${GITOPS_COMMIT}" =~ ^[0-9a-fA-F]{40}$ ]]; then
-#             echo "ERROR: Invalid GitOps commit."
-#             exit 1
-#           fi
-
-#           if [[ -z "${ARGOCD_SERVER}" ]]; then
-#             echo "ERROR: ARGOCD_SERVER is not configured."
-#             exit 1
-#           fi
-
-#           if [[ -z "${ARGOCD_AUTH_TOKEN}" ]]; then
-#             echo "ERROR: ARGOCD_AUTH_TOKEN is not configured."
-#             exit 1
-#           fi
-
-#           echo "Deployment verification inputs are valid."
-
-#       - name: Checkout Verified Release Snapshot
-
-#         uses: actions/checkout@v4
-
-#         with:
-
-#           repository: ${{ vars.GITOPS_REPOSITORY }}
-
-#           token: ${{ secrets.GITOPS_TOKEN }}
-
-#           ref: ${{ needs.resolve-release.outputs.release-registry-commit }}
-
-#           path: release-registry
-
-#           fetch-depth: 1
-
-#           persist-credentials: false
-
-#       - name: Install yq
-
-#         shell: bash
-
-#         run: |
-
-#           set -euo pipefail
-
-#           YQ_VERSION="v4.44.3"
-
-#           sudo wget \
-#             --quiet \
-#             --output-document=/usr/local/bin/yq \
-#             "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
-
-#           sudo chmod +x /usr/local/bin/yq
-
-#           yq --version
-
-#       - name: Install Argo CD CLI
-
-#         shell: bash
-
-#         run: |
-
-#           set -euo pipefail
-
-#           ARGOCD_VERSION="v3.1.0"
-
-#           curl \
-#             --fail \
-#             --silent \
-#             --show-error \
-#             --location \
-#             --output /tmp/argocd \
-#             "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64"
-
-#           sudo install -m 0555 /tmp/argocd /usr/local/bin/argocd
-
-#           argocd version --client
-
-#       - name: Verify Argo CD Connectivity
-
-#         shell: bash
-
-#         run: |
-
-#           set -euo pipefail
-
-#           argocd account get-user-info \
-#             --server "${ARGOCD_SERVER}" \
-#             --auth-token "${ARGOCD_AUTH_TOKEN}" \
-#             --grpc-web
-
-#       - name: Wait for Staging Applications
-
-#         id: verify
-
-#         shell: bash
-
-#         run: |
-
-#           set -euo pipefail
-
-#           RELEASE_FILE="release-registry/${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
-
-#           if [[ ! -s "${RELEASE_FILE}" ]]; then
-#             echo "ERROR: Release Registry record missing."
-#             exit 1
-#           fi
-
-#           EXPECTED_COUNT=$(yq '.images | length' "${RELEASE_FILE}")
-
-#           VERIFIED_COUNT=0
-
-#           while IFS= read -r SERVICE
-#           do
-#             ARGO_APP="${SERVICE}"
-
-#             echo "=========================================="
-#             echo "Waiting for ${ARGO_APP}"
-#             echo "=========================================="
-
-#             argocd app wait "${ARGO_APP}" \
-#               --server "${ARGOCD_SERVER}" \
-#               --auth-token "${ARGOCD_AUTH_TOKEN}" \
-#               --grpc-web \
-#               --sync \
-#               --health \
-#               --timeout 600
-
-#             SYNC_STATUS=$(
-#               argocd app get "${ARGO_APP}" \
-#                 --server "${ARGOCD_SERVER}" \
-#                 --auth-token "${ARGOCD_AUTH_TOKEN}" \
-#                 --grpc-web \
-#                 --output json \
-#               | jq -r '.status.sync.status'
-#             )
-
-#             HEALTH_STATUS=$(
-#               argocd app get "${ARGO_APP}" \
-#                 --server "${ARGOCD_SERVER}" \
-#                 --auth-token "${ARGOCD_AUTH_TOKEN}" \
-#                 --grpc-web \
-#                 --output json \
-#               | jq -r '.status.health.status'
-#             )
-
-#             REVISION=$(
-#               argocd app get "${ARGO_APP}" \
-#                 --server "${ARGOCD_SERVER}" \
-#                 --auth-token "${ARGOCD_AUTH_TOKEN}" \
-#                 --grpc-web \
-#                 --output json \
-#               | jq -r '.status.sync.revision'
-#             )
-
-#             echo "Application : ${ARGO_APP}"
-#             echo "Sync        : ${SYNC_STATUS}"
-#             echo "Health      : ${HEALTH_STATUS}"
-#             echo "Revision    : ${REVISION}"
-
-#             if [[ "${SYNC_STATUS}" != "Synced" ]]; then
-#               echo "ERROR: ${ARGO_APP} is not Synced."
-#               exit 1
-#             fi
-
-#             if [[ "${HEALTH_STATUS}" != "Healthy" ]]; then
-#               echo "ERROR: ${ARGO_APP} is not Healthy."
-#               exit 1
-#             fi
-
-#             if [[ "${REVISION}" != "${GITOPS_COMMIT}" ]]; then
-#               echo "ERROR: ${ARGO_APP} is healthy but not reconciled to the promoted GitOps commit."
-#               echo "Expected revision: ${GITOPS_COMMIT}"
-#               echo "Actual revision  : ${REVISION}"
-#               exit 1
-#             fi
-
-#             VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
-
-#           done < <(yq -r '.images | keys | .[]' "${RELEASE_FILE}")
-
-#           if (( VERIFIED_COUNT != EXPECTED_COUNT )); then
-#             echo "ERROR: Argo CD verification count mismatch."
-#             echo "Expected : ${EXPECTED_COUNT}"
-#             echo "Verified : ${VERIFIED_COUNT}"
-#             exit 1
-#           fi
-
-#           {
-#             echo "release-id=${RELEASE_ID}"
-#             echo "applications-verified=${VERIFIED_COUNT}"
-#           } >> "${GITHUB_OUTPUT}"
-
-#           echo "All Staging applications are Synced and Healthy."
-
-#       - name: Run Staging Smoke Test
-
-#         id: smoke
-
-#         shell: bash
-
-#         run: |
-
-#           set -euo pipefail
-
-#           if [[ -z "${STAGING_BASE_URL}" ]]; then
-#             echo "status=not-configured" >> "${GITHUB_OUTPUT}"
-#             echo "STAGING_BASE_URL is not configured; smoke test skipped."
-#             exit 0
-#           fi
-
-#           HEALTH_URL="${STAGING_BASE_URL%/}/health"
-
-#           echo "Smoke testing:"
-#           echo "${HEALTH_URL}"
-
-#           MAX_ATTEMPTS=5
-#           ATTEMPT=1
-
-#           while (( ATTEMPT <= MAX_ATTEMPTS ))
-#           do
-#             HTTP_STATUS=$(
-#               curl \
-#                 --silent \
-#                 --show-error \
-#                 --output /tmp/health-response \
-#                 --write-out "%{http_code}" \
-#                 --max-time 15 \
-#                 "${HEALTH_URL}" \
-#               || true
-#             )
-
-#             echo "Attempt ${ATTEMPT}: HTTP ${HTTP_STATUS}"
-
-#             if [[ "${HTTP_STATUS}" == "200" ]]; then
-#               echo "status=passed" >> "${GITHUB_OUTPUT}"
-#               echo "Staging smoke test successful."
-#               exit 0
-#             fi
-
-#             if (( ATTEMPT == MAX_ATTEMPTS )); then
-#               echo "ERROR: Staging smoke test failed."
-#               cat /tmp/health-response 2>/dev/null || true
-#               exit 1
-#             fi
-
-#             ATTEMPT=$((ATTEMPT + 1))
-
-#             sleep 10
-
-#           done
-
-#       - name: Write Deployment Verification Summary
-
-#         env:
-
-#           APPLICATION_COUNT: ${{ steps.verify.outputs.applications-verified }}
-
-#           SMOKE_TEST_STATUS: ${{ steps.smoke.outputs.status }}
-
-#         shell: bash
-
-#         run: |
-
-#           {
-#             echo "## Staging Deployment Verification"
-#             echo ""
-#             echo "| Attribute | Result |"
-#             echo "|---|---|"
-#             echo "| Release | \`${RELEASE_ID}\` |"
-#             echo "| GitOps Commit | \`${GITOPS_COMMIT}\` |"
-#             echo "| Applications Verified | ${APPLICATION_COUNT} |"
-#             echo "| Argo CD Sync | Passed |"
-#             echo "| Argo CD Health | Passed |"
-#             echo "| Smoke Test | ${SMOKE_TEST_STATUS} |"
-#             echo "| Result | **Staging deployment verified** |"
-#           } >> "${GITHUB_STEP_SUMMARY}"
-  verify-staging-deployment:
- 
-    name: Verify Staging Deployment (SIMULATED)
- 
     needs:
       - resolve-release
       - verify-release-artifacts
-      - update-staging-gitops
-      - record-staging-promotion
- 
+      - update-production-gitops
+      - record-production-promotion
+
     runs-on: ubuntu-latest
- 
+
     timeout-minutes: 10
- 
+
     env:
- 
+
       RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
- 
-      GITOPS_COMMIT: ${{ needs.update-staging-gitops.outputs.gitops-commit }}
- 
+
+      GITOPS_COMMIT: ${{ needs.update-production-gitops.outputs.gitops-commit }}
+
     outputs:
- 
+
       release-id: ${{ steps.verify.outputs.release-id }}
- 
+
       applications-verified: ${{ steps.verify.outputs.applications-verified }}
- 
+
       smoke-test-status: ${{ steps.smoke.outputs.status }}
- 
+
     steps:
- 
+
       - name: Validate Verification Inputs
- 
+
         env:
- 
-          PROMOTION_STATUS: ${{ needs.record-staging-promotion.outputs.promotion-status }}
- 
-          PROMOTED_RELEASE_ID: ${{ needs.record-staging-promotion.outputs.release-id }}
- 
+
+          PROMOTION_STATUS: ${{ needs.record-production-promotion.outputs.promotion-status }}
+
+          PROMOTED_RELEASE_ID: ${{ needs.record-production-promotion.outputs.release-id }}
+
         shell: bash
- 
+
         run: |
- 
+
           set -euo pipefail
- 
+
           if [[ "${PROMOTED_RELEASE_ID}" != "${RELEASE_ID}" ]]; then
             echo "ERROR: Promotion release mismatch."
             exit 1
           fi
- 
+
           if [[ "${PROMOTION_STATUS}" != "gitops-updated" ]]; then
             echo "ERROR: Release has not reached gitops-updated."
             exit 1
           fi
- 
+
           if [[ ! "${GITOPS_COMMIT}" =~ ^[0-9a-fA-F]{40}$ ]]; then
             echo "ERROR: Invalid GitOps commit."
             exit 1
           fi
- 
+
           echo "Deployment verification inputs are valid (simulation mode)."
- 
+
       - name: Checkout Verified Release Snapshot
- 
+
         uses: actions/checkout@v4
- 
+
         with:
- 
+
           repository: ${{ vars.GITOPS_REPOSITORY }}
- 
+
           token: ${{ secrets.GITOPS_TOKEN }}
- 
+
           ref: ${{ needs.resolve-release.outputs.release-registry-commit }}
- 
+
           path: release-registry
- 
+
           fetch-depth: 1
- 
+
           persist-credentials: false
- 
+
       - name: Install yq
- 
+
         shell: bash
- 
+
         run: |
- 
+
           set -euo pipefail
- 
+
           YQ_VERSION="v4.44.3"
- 
+
           sudo wget \
             --quiet \
             --output-document=/usr/local/bin/yq \
             "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
- 
+
           sudo chmod +x /usr/local/bin/yq
- 
+
           yq --version
- 
-      - name: Simulate Wait for Staging Applications
- 
+
+      - name: Simulate Wait for Production Applications
+
         id: verify
- 
+
         env:
- 
+
           RELEASE_REGISTRY_PATH: ${{ env.RELEASE_REGISTRY_PATH }}
- 
+
         shell: bash
- 
+
         run: |
- 
+
           set -euo pipefail
- 
+
           RELEASE_FILE="release-registry/${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
- 
+
           if [[ ! -s "${RELEASE_FILE}" ]]; then
             echo "ERROR: Release Registry record missing."
             exit 1
           fi
- 
+
           EXPECTED_COUNT=$(yq '.images | length' "${RELEASE_FILE}")
- 
+
           VERIFIED_COUNT=0
- 
+
           echo "=========================================="
           echo "SIMULATION MODE: no Argo CD server contacted"
           echo "=========================================="
- 
+
           while IFS= read -r SERVICE
           do
             ARGO_APP="${SERVICE}"
- 
+
             echo "------------------------------------------"
             echo "Simulating: ${ARGO_APP}"
             echo "------------------------------------------"
- 
+
             SYNC_STATUS="Synced"
             HEALTH_STATUS="Healthy"
             REVISION="${GITOPS_COMMIT}"
- 
+
             echo "Application : ${ARGO_APP}"
             echo "Sync        : ${SYNC_STATUS} (simulated)"
             echo "Health      : ${HEALTH_STATUS} (simulated)"
             echo "Revision    : ${REVISION} (simulated)"
- 
+
             VERIFIED_COUNT=$((VERIFIED_COUNT + 1))
- 
+
           done < <(yq -r '.images | keys | .[]' "${RELEASE_FILE}")
- 
+
           if (( VERIFIED_COUNT != EXPECTED_COUNT )); then
             echo "ERROR: Simulated verification count mismatch."
             echo "Expected : ${EXPECTED_COUNT}"
             echo "Verified : ${VERIFIED_COUNT}"
             exit 1
           fi
- 
+
           {
             echo "release-id=${RELEASE_ID}"
             echo "applications-verified=${VERIFIED_COUNT}"
           } >> "${GITHUB_OUTPUT}"
- 
-          echo "All Staging applications simulated as Synced and Healthy."
- 
-      - name: Simulate Staging Smoke Test
- 
+
+          echo "All Production applications simulated as Synced and Healthy."
+
+      - name: Simulate Production Smoke Test
+
         id: smoke
- 
+
         shell: bash
- 
+
         run: |
- 
+
           set -euo pipefail
- 
+
           echo "status=passed" >> "${GITHUB_OUTPUT}"
- 
-          echo "Staging smoke test simulated as passed (no real HTTP call made)."
- 
+
+          echo "Production smoke test simulated as passed (no real HTTP call made)."
+
       - name: Write Deployment Verification Summary
- 
+
         env:
- 
+
           APPLICATION_COUNT: ${{ steps.verify.outputs.applications-verified }}
- 
+
           SMOKE_TEST_STATUS: ${{ steps.smoke.outputs.status }}
- 
+
         shell: bash
- 
+
         run: |
- 
+
           {
-            echo "## Staging Deployment Verification (SIMULATED)"
+            echo "## Production Deployment Verification (SIMULATED)"
             echo ""
             echo "| Attribute | Result |"
             echo "|---|---|"
@@ -2293,44 +1966,41 @@ jobs:
             echo "| Argo CD Sync | Simulated |"
             echo "| Argo CD Health | Simulated |"
             echo "| Smoke Test | ${SMOKE_TEST_STATUS} (simulated) |"
-            echo "| Result | **Staging deployment simulated as verified** |"
+            echo "| Result | **Production deployment simulated as verified** |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
+  record-production-verification:
 
-  record-staging-verification:
-
-    name: Record Staging Verification
+    name: Record Production Verification
 
     needs:
       - resolve-release
-      - update-staging-gitops
-      - record-staging-promotion
-      - verify-staging-deployment
+      - update-production-gitops
+      - record-production-promotion
+      - verify-production-deployment
 
     runs-on: ubuntu-latest
 
     timeout-minutes: 10
 
     environment:
-      name: staging
+      name: production
 
     env:
 
       RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
 
-      GITOPS_COMMIT: ${{ needs.update-staging-gitops.outputs.gitops-commit }}
+      GITOPS_COMMIT: ${{ needs.update-production-gitops.outputs.gitops-commit }}
 
-      APPLICATIONS_VERIFIED: ${{ needs.verify-staging-deployment.outputs.applications-verified }}
+      APPLICATIONS_VERIFIED: ${{ needs.verify-production-deployment.outputs.applications-verified }}
 
-      SMOKE_TEST_STATUS: ${{ needs.verify-staging-deployment.outputs.smoke-test-status }}
-
-   
+      SMOKE_TEST_STATUS: ${{ needs.verify-production-deployment.outputs.smoke-test-status }}
 
     outputs:
 
       release-id: ${{ steps.record.outputs.release-id }}
 
-      staging-status: ${{ steps.record.outputs.staging-status }}
+      production-status: ${{ steps.record.outputs.production-status }}
 
       verification-commit: ${{ steps.push.outputs.verification-commit }}
 
@@ -2340,9 +2010,9 @@ jobs:
 
         env:
 
-          VERIFIED_RELEASE_ID: ${{ needs.verify-staging-deployment.outputs.release-id }}
+          VERIFIED_RELEASE_ID: ${{ needs.verify-production-deployment.outputs.release-id }}
 
-          CURRENT_PROMOTION_STATUS: ${{ needs.record-staging-promotion.outputs.promotion-status }}
+          CURRENT_PROMOTION_STATUS: ${{ needs.record-production-promotion.outputs.promotion-status }}
 
         shell: bash
 
@@ -2356,7 +2026,7 @@ jobs:
           fi
 
           if [[ "${CURRENT_PROMOTION_STATUS}" != "gitops-updated" ]]; then
-            echo "ERROR: Staging promotion has not reached gitops-updated."
+            echo "ERROR: Production promotion has not reached gitops-updated."
             exit 1
           fi
 
@@ -2365,7 +2035,7 @@ jobs:
             exit 1
           fi
 
-          echo "Staging verification evidence is valid."
+          echo "Production verification evidence is valid."
 
       - name: Checkout Release Registry
 
@@ -2404,7 +2074,7 @@ jobs:
 
           yq --version
 
-      - name: Validate Current Staging State
+      - name: Validate Current Production State
 
         shell: bash
 
@@ -2420,8 +2090,8 @@ jobs:
           fi
 
           REGISTERED_RELEASE_ID=$(yq -r '.release.id' "${RELEASE_FILE}")
-          CURRENT_STATUS=$(yq -r '.promotion.staging.status' "${RELEASE_FILE}")
-          RECORDED_GITOPS_COMMIT=$(yq -r '.promotion.staging.gitopsCommit' "${RELEASE_FILE}")
+          CURRENT_STATUS=$(yq -r '.promotion.production.status' "${RELEASE_FILE}")
+          RECORDED_GITOPS_COMMIT=$(yq -r '.promotion.production.gitopsCommit' "${RELEASE_FILE}")
 
           if [[ "${REGISTERED_RELEASE_ID}" != "${RELEASE_ID}" ]]; then
             echo "ERROR: Release identity mismatch."
@@ -2442,7 +2112,7 @@ jobs:
 
           echo "Allowed transition: gitops-updated -> verified"
 
-      - name: Record Staging Verification
+      - name: Record Production Verification
 
         id: record
 
@@ -2469,27 +2139,27 @@ jobs:
           export SMOKE_TEST_STATUS
 
           yq -i '
-            .promotion.staging.status = "verified" |
-            .promotion.staging.verifiedAt = strenv(VERIFIED_AT) |
-            .promotion.staging.verificationWorkflowRunId = strenv(VERIFICATION_RUN_ID) |
-            .promotion.staging.verificationWorkflowRunAttempt = strenv(VERIFICATION_RUN_ATTEMPT) |
-            .promotion.staging.applicationsVerified = (strenv(APPLICATIONS_VERIFIED) | tonumber) |
-            .promotion.staging.smokeTestStatus = strenv(SMOKE_TEST_STATUS)
+            .promotion.production.status = "verified" |
+            .promotion.production.verifiedAt = strenv(VERIFIED_AT) |
+            .promotion.production.verificationWorkflowRunId = strenv(VERIFICATION_RUN_ID) |
+            .promotion.production.verificationWorkflowRunAttempt = strenv(VERIFICATION_RUN_ATTEMPT) |
+            .promotion.production.applicationsVerified = (strenv(APPLICATIONS_VERIFIED) | tonumber) |
+            .promotion.production.smokeTestStatus = strenv(SMOKE_TEST_STATUS)
           ' "${RELEASE_FILE}"
 
-          NEW_STATUS=$(yq -r '.promotion.staging.status' "${RELEASE_FILE}")
+          NEW_STATUS=$(yq -r '.promotion.production.status' "${RELEASE_FILE}")
 
           if [[ "${NEW_STATUS}" != "verified" ]]; then
-            echo "ERROR: Failed to record Staging verification."
+            echo "ERROR: Failed to record Production verification."
             exit 1
           fi
 
           {
             echo "release-id=${RELEASE_ID}"
-            echo "staging-status=${NEW_STATUS}"
+            echo "production-status=${NEW_STATUS}"
           } >> "${GITHUB_OUTPUT}"
 
-          echo "Staging release verified."
+          echo "Production release verified."
           echo "Release: ${RELEASE_ID}"
           echo "Status : ${NEW_STATUS}"
 
@@ -2540,7 +2210,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "production": .promotion.production
+              "staging": .promotion.staging
             }
           ' /tmp/release-before.yaml > /tmp/immutable-before.json
 
@@ -2552,7 +2222,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "production": .promotion.production
+              "staging": .promotion.staging
             }
           ' "${RELEASE_FILE}" > /tmp/immutable-after.json
 
@@ -2577,7 +2247,7 @@ jobs:
 
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Commit Staging Verification
+      - name: Commit Production Verification
 
         working-directory: gitops
 
@@ -2592,16 +2262,16 @@ jobs:
           git add -- "${RELEASE_FILE}"
 
           if git diff --cached --quiet; then
-            echo "ERROR: No Staging verification change staged."
+            echo "ERROR: No Production verification change staged."
             exit 1
           fi
 
           git commit \
-            -m "release: verify staging ${RELEASE_ID}" \
+            -m "release: verify production ${RELEASE_ID}" \
             -m "GitOps commit: ${GITOPS_COMMIT}" \
             -m "Workflow run: ${{ github.run_id }}"
 
-      - name: Push Staging Verification
+      - name: Push Production Verification
 
         id: push
 
@@ -2617,10 +2287,10 @@ jobs:
 
           RELEASE_FILE="${RELEASE_REGISTRY_PATH}/${RELEASE_ID}/release.yaml"
 
-          FINAL_STATUS=$(yq -r '.promotion.staging.status' "${RELEASE_FILE}")
+          FINAL_STATUS=$(yq -r '.promotion.production.status' "${RELEASE_FILE}")
 
           if [[ "${FINAL_STATUS}" != "verified" ]]; then
-            echo "ERROR: Staging state changed during rebase."
+            echo "ERROR: Production state changed during rebase."
             exit 1
           fi
 
@@ -2630,10 +2300,10 @@ jobs:
 
           echo "verification-commit=${VERIFICATION_COMMIT}" >> "${GITHUB_OUTPUT}"
 
-          echo "Staging verification pushed."
+          echo "Production verification pushed."
           echo "Registry commit: ${VERIFICATION_COMMIT}"
 
-      - name: Verify Staging Verification Record
+      - name: Verify Production Verification Record
 
         working-directory: gitops
 
@@ -2654,9 +2324,9 @@ jobs:
             exit 1
           fi
 
-          echo "Staging verification record confirmed."
+          echo "Production verification record confirmed."
 
-      - name: Write Final Staging Summary
+      - name: Write Final Production Summary
 
         env:
 
@@ -2667,15 +2337,15 @@ jobs:
         run: |
 
           {
-            echo "# Staging Release Verified"
+            echo "# Production Release Verified"
             echo ""
             echo "| Attribute | Value |"
             echo "|---|---|"
             echo "| Release | \`${RELEASE_ID}\` |"
             echo "| GitOps Commit | \`${GITOPS_COMMIT}\` |"
             echo "| Applications Verified | ${APPLICATIONS_VERIFIED} |"
-            echo "| Argo CD Sync | Passed |"
-            echo "| Argo CD Health | Passed |"
-            echo "| Staging Status | **verified** |"
+            echo "| Argo CD Sync | Simulated |"
+            echo "| Argo CD Health | Simulated |"
+            echo "| Production Status | **verified** |"
             echo "| Verification Commit | \`${VERIFICATION_COMMIT}\` |"
           } >> "${GITHUB_STEP_SUMMARY}"
