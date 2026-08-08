@@ -1068,6 +1068,36 @@ jobs:
           echo "=========================================="
           echo "Release          : ${RELEASE_ID}"
           echo "Services updated : ${UPDATED_COUNT}"
+      - name: Update Staging Release State
+        shell: bash
+        env:
+          RELEASE_ID: ${{ env.RELEASE_ID }}
+        run: |
+          set -euo pipefail
+
+          STATE_FILE="gitops/environments/staging.yaml"
+
+          if [[ ! -f "${STATE_FILE}" ]]; then
+            echo "Environment state file missing."
+            exit 1
+          fi
+
+          CURRENT_RELEASE=$(yq -r '.currentRelease' "${STATE_FILE}")
+
+          export RELEASE_ID
+          export CURRENT_RELEASE
+
+          yq -i '
+            .desiredRelease = strenv(RELEASE_ID) |
+            .status = "deploying" |
+            .rollback.available = (
+              (strenv(CURRENT_RELEASE) != "") and
+              (strenv(CURRENT_RELEASE) != strenv(RELEASE_ID))
+            ) |
+            .rollback.target = strenv(CURRENT_RELEASE)
+          ' "${STATE_FILE}"
+          echo "Environment state updated."
+
 
       - name: Review GitOps Changes
 
@@ -1087,7 +1117,9 @@ jobs:
 
           echo ""
 
-          git diff -- 'applications/*/environments/staging/values.yaml'
+          git diff -- \
+            'applications/*/environments/dev/values.yaml' \
+            'environments/staging.yaml'
 
       - name: Validate GitOps Change Scope
 
@@ -1113,11 +1145,12 @@ jobs:
           do
             [[ -z "${FILE}" ]] && continue
 
-            if [[ "${FILE}" =~ ^applications/[^/]+/environments/staging/values\.yaml$ ]]; then
-              echo "Allowed change: ${FILE}"
+           if [[ "${FILE}" =~ ^applications/[^/]+/environments/staging/values\.yaml$ ]] ||
+              [[ "${FILE}" == "environments/staging.yaml" ]]; then
+                echo "Allowed change: ${FILE}"
             else
-              echo "ERROR: Unauthorized GitOps change detected: ${FILE}"
-              INVALID_CHANGE=true
+                echo "ERROR: Unauthorized GitOps change: ${FILE}"
+                INVALID_CHANGE=true
             fi
           done <<< "${CHANGED_FILES}"
 
@@ -2154,8 +2187,18 @@ jobs:
           fi
  
           echo "Deployment verification inputs are valid (simulation mode)."
+      - name: Checkout Writable GitOps Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          ref: main
+          path: gitops
+          fetch-depth: 0
+          persist-credentials: true
  
       - name: Checkout Verified Release Snapshot
+        
  
         uses: actions/checkout@v4
  
@@ -2269,6 +2312,52 @@ jobs:
           echo "status=passed" >> "${GITHUB_OUTPUT}"
  
           echo "Staging smoke test simulated as passed (no real HTTP call made)."
+      - name: Mark Development Deployment Successful
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          STATE_FILE="gitops/environments/staging.yaml"
+
+          if [[ ! -f "${STATE_FILE}" ]]; then
+            echo "ERROR: Environment state file missing."
+            exit 1
+          fi
+
+          export RELEASE_ID
+
+          yq -i '
+            .currentRelease = strenv(RELEASE_ID) |
+            .desiredRelease = strenv(RELEASE_ID) |
+            .status = "healthy" |
+            .lastSuccessfulDeployment = strenv(RELEASE_ID)
+          ' "${STATE_FILE}"
+
+          echo ""
+          echo "Updated environment state:"
+          cat "${STATE_FILE}"
+      - name: Configure Git Identity
+        working-directory: gitops
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit Environment State
+        working-directory: gitops
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add environments/staging.yaml
+
+          if git diff --cached --quiet; then
+            echo "No environment state changes."
+            exit 0
+          fi
+
+          git commit \
+            -m "deploy(staging): deployment verified ${RELEASE_ID}"
  
       - name: Write Deployment Verification Summary
  
