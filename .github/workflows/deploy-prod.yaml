@@ -1001,7 +1001,7 @@ jobs:
             TAG=$(SERVICE="${SERVICE}" yq -r '.images[strenv(SERVICE)].tag' "${RELEASE_FILE}")
             DIGEST=$(SERVICE="${SERVICE}" yq -r '.images[strenv(SERVICE)].digest' "${RELEASE_FILE}")
 
-            VALUES_FILE="gitops/applications/${SERVICE}/environments/production/values.yaml"
+            VALUES_FILE="gitops/applications/${SERVICE}/environments/prod/values.yaml"
 
             if [[ -z "${REPOSITORY}" || "${REPOSITORY}" == "null" ]]; then
               echo "ERROR: Repository missing for ${SERVICE}."
@@ -1097,7 +1097,7 @@ jobs:
 
           echo ""
 
-          git diff -- 'applications/*/environments/production/values.yaml'
+          git diff -- 'applications/*/environments/prod/values.yaml'
 
       - name: Validate GitOps Change Scope
 
@@ -1123,7 +1123,7 @@ jobs:
           do
             [[ -z "${FILE}" ]] && continue
 
-            if [[ "${FILE}" =~ ^applications/[^/]+/environments/production/values\.yaml$ ]]; then
+            if [[ "${FILE}" =~ ^applications/[^/]+/environments/prod/values\.yaml$ ]]; then
               echo "Allowed change: ${FILE}"
             else
               echo "ERROR: Unauthorized GitOps change detected: ${FILE}"
