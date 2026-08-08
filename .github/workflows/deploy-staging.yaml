@@ -398,18 +398,17 @@ jobs:
 
     timeout-minutes: 20
 
-    environment:
-      name: staging
+    # environment:
+    #   name: staging
 
     env:
 
       AWS_REGION: ${{ vars.AWS_REGION }}
 
-      AWS_ROLE_ARN: ${{ vars.STAGING_AWS_ROLE_ARN }}
-
       RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
 
       REGISTRY_COMMIT: ${{ needs.resolve-release.outputs.release-registry-commit }}
+   
 
    
 
@@ -511,6 +510,8 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
           role-session-name: staging-release-${{ github.run_id }}
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Verify AWS Identity
 
