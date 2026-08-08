@@ -2314,7 +2314,7 @@ jobs:
           echo "status=passed" >> "${GITHUB_OUTPUT}"
  
           echo "Staging smoke test simulated as passed (no real HTTP call made)."
-      - name: Mark Development Deployment Successful
+      - name: Mark Staging Deployment Successful
         shell: bash
         run: |
           set -euo pipefail
@@ -2360,6 +2360,21 @@ jobs:
 
           git commit \
             -m "deploy(staging): deployment verified ${RELEASE_ID}"
+      - name: Push Environment State
+        working-directory: gitops
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Refreshing main..."
+
+          git pull --rebase origin main
+
+          echo "Pushing..."
+
+          git push origin HEAD:main
+
+          echo "Environment state pushed successfully."
  
       - name: Write Deployment Verification Summary
  
