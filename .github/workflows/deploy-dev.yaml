@@ -1651,7 +1651,7 @@ jobs:
 
           echo ""
 
-          git add -- \
+          git diff -- \
             'applications/*/environments/dev/values.yaml' \
             'environments/development.yaml'
 
