@@ -1602,6 +1602,37 @@ jobs:
 
           echo "Services updated : ${UPDATED_COUNT}"
 
+      - name: Update Development Release State
+        shell: bash
+        env:
+          RELEASE_ID: ${{ env.RELEASE_ID }}
+        run: |
+          set -euo pipefail
+
+          STATE_FILE="gitops/environments/development.yaml"
+
+          if [[ ! -f "${STATE_FILE}" ]]; then
+            echo "Environment state file missing."
+            exit 1
+          fi
+
+          CURRENT_RELEASE=$(yq -r '.currentRelease' "${STATE_FILE}")
+
+          export RELEASE_ID
+          export CURRENT_RELEASE
+
+          yq -i '
+            .desiredRelease = strenv(RELEASE_ID) |
+            .status = "deploying" |
+            .rollback.available = (
+              (strenv(CURRENT_RELEASE) != "") and
+              (strenv(CURRENT_RELEASE) != strenv(RELEASE_ID))
+            ) |
+            .rollback.target = strenv(CURRENT_RELEASE)
+          ' "${STATE_FILE}"
+
+          echo "Environment state updated."
+
       - name: Review GitOps Changes
 
         working-directory: gitops
@@ -1620,8 +1651,9 @@ jobs:
 
           echo ""
 
-          git diff -- \
-            'applications/*/environments/dev/values.yaml'
+          git add -- \
+            'applications/*/environments/dev/values.yaml' \
+            'environments/development.yaml'
 
       - name: Validate GitOps Change Scope
 
@@ -1658,17 +1690,14 @@ jobs:
 
             [[ -z "${FILE}" ]] && continue
 
-            if [[ "${FILE}" =~ ^applications/[^/]+/environments/dev/values\.yaml$ ]]; then
-
-              echo "Allowed change: ${FILE}"
-
-            else
-
-              echo "ERROR: Unauthorized GitOps change detected: ${FILE}"
-
-              INVALID_CHANGE=true
-
-            fi
+            if [[ "${FILE}" =~ ^applications/[^/]+/environments/dev/values\.yaml$ ]] ||
+                [[ "${FILE}" == "environments/development.yaml" ]]; then
+                  echo "Allowed change: ${FILE}"
+              else
+                  echo "ERROR: Unauthorized GitOps change: ${FILE}"
+                  INVALID_CHANGE=true
+              fi
+          
 
           done <<< "${CHANGED_FILES}"
 
@@ -1717,7 +1746,8 @@ jobs:
           set -euo pipefail
 
           git add -- \
-            'applications/*/environments/dev/values.yaml'
+            'applications/*/environments/dev/values.yaml' \
+            'environments/development.yaml'
 
           if git diff --cached --quiet; then
 
