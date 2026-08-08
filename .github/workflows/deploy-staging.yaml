@@ -398,17 +398,18 @@ jobs:
 
     timeout-minutes: 20
 
-    # environment:
-    #   name: staging
+    environment:
+      name: staging
 
     env:
 
       AWS_REGION: ${{ vars.AWS_REGION }}
 
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
       RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
 
       REGISTRY_COMMIT: ${{ needs.resolve-release.outputs.release-registry-commit }}
-   
 
    
 
@@ -505,7 +506,7 @@ jobs:
 
         with:
 
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
 
           aws-region: ${{ env.AWS_REGION }}
 
