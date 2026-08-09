@@ -1118,7 +1118,7 @@ jobs:
           echo ""
 
           git diff -- \
-            'applications/*/environments/dev/values.yaml' \
+            'applications/*/environments/staging/values.yaml' \
             'environments/staging.yaml'
 
       - name: Validate GitOps Change Scope

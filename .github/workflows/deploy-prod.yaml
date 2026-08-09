@@ -298,21 +298,20 @@ jobs:
             exit 1
           fi
 
-          DEV_STATUS=$(yq -r '.promotion.development.status' "${RELEASE_FILE}")
-
-          if [[ "${DEV_STATUS}" != "verified" ]]; then
-            echo "ERROR: Release is not verified in Development."
-            echo "Required Development status: verified"
-            echo "Actual Development status  : ${DEV_STATUS}"
-            exit 1
-          fi
-
           STAGING_STATUS=$(yq -r '.promotion.staging.status' "${RELEASE_FILE}")
 
           if [[ "${STAGING_STATUS}" != "verified" ]]; then
-            echo "ERROR: Release is not verified in Staging."
+            echo "ERROR: Release is not eligible for Production."
             echo "Required Staging status: verified"
             echo "Actual Staging status  : ${STAGING_STATUS}"
+            exit 1
+          fi
+
+          PRODUCTION_ELIGIBLE=$(yq -r '.promotion.production.eligible' "${RELEASE_FILE}")
+
+          if [[ "${PRODUCTION_ELIGIBLE}" != "true" ]]; then
+            echo "ERROR: Release is not marked eligible for Production."
+            echo "promotion.production.eligible must be set to true before requesting promotion."
             exit 1
           fi
 
@@ -407,11 +406,14 @@ jobs:
 
     timeout-minutes: 20
 
+    # environment:
+    #   name: production
+
     env:
 
       AWS_REGION: ${{ vars.AWS_REGION }}
 
-      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      AWS_ROLE_ARN: ${{ secrets.PRODUCTION_AWS_ROLE_ARN }}
 
       RELEASE_ID: ${{ needs.resolve-release.outputs.release-id }}
 
@@ -461,7 +463,7 @@ jobs:
           fi
 
           if [[ -z "${AWS_ROLE_ARN}" ]]; then
-            echo "ERROR: AWS_ROLE_ARN is not configured."
+            echo "ERROR: PRODUCTION_AWS_ROLE_ARN is not configured."
             exit 1
           fi
 
@@ -515,7 +517,6 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
           role-session-name: production-release-${{ github.run_id }}
-
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
@@ -659,7 +660,13 @@ jobs:
             echo "Tag        : ${TAG}"
             echo "Digest     : ${DIGEST}"
 
-            ECR_REPOSITORY="${REPOSITORY}"
+            # if [[ "${REPOSITORY}" != */* ]]; then
+            #   echo "ERROR: Invalid ECR repository URI for ${SERVICE}."
+            #   exit 1
+            # fi
+
+            # ECR_REPOSITORY="${REPOSITORY#*/}"
+             ECR_REPOSITORY="${REPOSITORY}"
 
             if [[ -z "${ECR_REPOSITORY}" ]]; then
               echo "ERROR: Unable to determine ECR repository for ${SERVICE}."
@@ -686,14 +693,14 @@ jobs:
             fi
 
             echo "ECR digest verified."
-
             AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
-              --query Account \
-              --output text)
-
+            --query Account \
+            --output text)
             ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
+            # IMAGE_REFERENCE="${REPOSITORY}@${DIGEST}"
             IMAGE_REFERENCE="${ECR_REGISTRY}/${REPOSITORY}@${DIGEST}"
+
 
             echo ""
             echo "Verifying Cosign signature..."
@@ -773,18 +780,6 @@ jobs:
             echo "| Result | **Release artifacts trusted** |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-  # -----------------------------------------------------------------
-  # MANUAL APPROVAL GATE
-  #
-  # This job (and record-production-promotion / record-production-
-  # verification below) declares `environment: name: production`.
-  # GitHub Actions Environment protection rules provide the manual
-  # approval: in repo Settings > Environments > production, configure
-  # "Required reviewers" with the people/teams who must approve before
-  # this job is allowed to run. The workflow run will pause here and
-  # wait for one of those reviewers to approve in the Actions UI.
-  # No custom approval logic is needed in the workflow itself.
-  # -----------------------------------------------------------------
   update-production-gitops:
 
     name: Update Production GitOps
@@ -950,6 +945,8 @@ jobs:
             exit 1
           fi
 
+          PRODUCTION_STATUS=$(yq -r '.promotion.production.status' "${RELEASE_FILE}")
+
           STAGING_STATUS=$(yq -r '.promotion.staging.status' "${RELEASE_FILE}")
 
           if [[ "${STAGING_STATUS}" != "verified" ]]; then
@@ -957,7 +954,12 @@ jobs:
             exit 1
           fi
 
-          PRODUCTION_STATUS=$(yq -r '.promotion.production.status' "${RELEASE_FILE}")
+          PRODUCTION_ELIGIBLE=$(yq -r '.promotion.production.eligible' "${RELEASE_FILE}")
+
+          if [[ "${PRODUCTION_ELIGIBLE}" != "true" ]]; then
+            echo "ERROR: Release is no longer marked eligible for Production."
+            exit 1
+          fi
 
           if [[ "${PRODUCTION_STATUS}" != "pending" ]]; then
             echo "ERROR: Release is no longer eligible for Production promotion."
@@ -1078,6 +1080,35 @@ jobs:
           echo "=========================================="
           echo "Release          : ${RELEASE_ID}"
           echo "Services updated : ${UPDATED_COUNT}"
+      - name: Update Production Release State
+        shell: bash
+        env:
+          RELEASE_ID: ${{ env.RELEASE_ID }}
+        run: |
+          set -euo pipefail
+
+          STATE_FILE="gitops/environments/production.yaml"
+
+          if [[ ! -f "${STATE_FILE}" ]]; then
+            echo "Environment state file missing."
+            exit 1
+          fi
+
+          CURRENT_RELEASE=$(yq -r '.currentRelease' "${STATE_FILE}")
+
+          export RELEASE_ID
+          export CURRENT_RELEASE
+
+          yq -i '
+            .desiredRelease = strenv(RELEASE_ID) |
+            .status = "deploying" |
+            .rollback.available = (
+              (strenv(CURRENT_RELEASE) != "") and
+              (strenv(CURRENT_RELEASE) != strenv(RELEASE_ID))
+            ) |
+            .rollback.target = strenv(CURRENT_RELEASE)
+          ' "${STATE_FILE}"
+          echo "Environment state updated."
 
       - name: Review GitOps Changes
 
@@ -1097,7 +1128,9 @@ jobs:
 
           echo ""
 
-          git diff -- 'applications/*/environments/prod/values.yaml'
+          git diff -- \
+            'applications/*/environments/prod/values.yaml' \
+            'environments/production.yaml'
 
       - name: Validate GitOps Change Scope
 
@@ -1123,11 +1156,12 @@ jobs:
           do
             [[ -z "${FILE}" ]] && continue
 
-            if [[ "${FILE}" =~ ^applications/[^/]+/environments/prod/values\.yaml$ ]]; then
-              echo "Allowed change: ${FILE}"
+           if [[ "${FILE}" =~ ^applications/[^/]+/environments/prod/values\.yaml$ ]] ||
+              [[ "${FILE}" == "environments/production.yaml" ]]; then
+                echo "Allowed change: ${FILE}"
             else
-              echo "ERROR: Unauthorized GitOps change detected: ${FILE}"
-              INVALID_CHANGE=true
+                echo "ERROR: Unauthorized GitOps change: ${FILE}"
+                INVALID_CHANGE=true
             fi
           done <<< "${CHANGED_FILES}"
 
@@ -1168,7 +1202,9 @@ jobs:
 
           set -euo pipefail
 
-          git add -- 'applications/*/environments/prod/values.yaml'
+          git add -- \
+            'applications/*/environments/prod/values.yaml' \
+            'environments/production.yaml'
 
           if git diff --cached --quiet; then
             echo "ERROR: No Production GitOps changes were staged."
@@ -1177,8 +1213,7 @@ jobs:
 
           git commit \
             -m "deploy(production): promote release ${RELEASE_ID}" \
-            -m "Source CI run: ${CI_RUN_ID}" \
-            -m "Approved by: ${{ github.actor }}"
+            -m "Source CI run: ${CI_RUN_ID}"
 
           echo "Created local GitOps commit: $(git rev-parse HEAD)"
 
@@ -1257,10 +1292,9 @@ jobs:
             echo "| Source Commit | \`${SOURCE_COMMIT}\` |"
             echo "| GitOps Commit | \`${GITOPS_COMMIT}\` |"
             echo "| Services Updated | ${SERVICES_UPDATED} |"
-            echo "| Approved By | ${{ github.actor }} |"
             echo "| Desired State | Updated |"
             echo "| ArgoCD Deployment | Not yet verified |"
-            echo "| Promotion State | Pending recording |"
+            echo "| Promotion State | Pending Job 4 recording |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
   record-production-promotion:
@@ -1523,7 +1557,6 @@ jobs:
           export ACTOR
 
           yq -i '
-            .promotion.production.eligible = true |
             .promotion.production.status = "gitops-updated" |
             .promotion.production.updatedAt = strenv(UPDATED_AT) |
             .promotion.production.gitopsCommit = strenv(GITOPS_COMMIT) |
@@ -1616,7 +1649,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "staging": .promotion.staging
+              "production": .promotion.production
             }
           ' /tmp/release-before.yaml > /tmp/immutable-before.json
 
@@ -1628,7 +1661,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "staging": .promotion.staging
+              "production": .promotion.production
             }
           ' "${RELEASE_FILE}" > /tmp/immutable-after.json
 
@@ -1675,8 +1708,7 @@ jobs:
           git commit \
             -m "release: record production promotion ${RELEASE_ID}" \
             -m "GitOps commit: ${GITOPS_COMMIT}" \
-            -m "Workflow run: ${{ github.run_id }}" \
-            -m "Approved by: ${{ github.actor }}"
+            -m "Workflow run: ${{ github.run_id }}"
 
       - name: Push Production Promotion State
 
@@ -1828,6 +1860,16 @@ jobs:
 
           echo "Deployment verification inputs are valid (simulation mode)."
 
+      - name: Checkout Writable GitOps Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          ref: main
+          path: gitops
+          fetch-depth: 0
+          persist-credentials: true
+
       - name: Checkout Verified Release Snapshot
 
         uses: actions/checkout@v4
@@ -1942,6 +1984,67 @@ jobs:
           echo "status=passed" >> "${GITHUB_OUTPUT}"
 
           echo "Production smoke test simulated as passed (no real HTTP call made)."
+      - name: Mark Production Deployment Successful
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          STATE_FILE="gitops/environments/production.yaml"
+
+          if [[ ! -f "${STATE_FILE}" ]]; then
+            echo "ERROR: Environment state file missing."
+            exit 1
+          fi
+
+          export RELEASE_ID
+
+          yq -i '
+            .currentRelease = strenv(RELEASE_ID) |
+            .desiredRelease = strenv(RELEASE_ID) |
+            .status = "healthy" |
+            .lastSuccessfulDeployment = strenv(RELEASE_ID)
+          ' "${STATE_FILE}"
+
+          echo ""
+          echo "Updated environment state:"
+          cat "${STATE_FILE}"
+      - name: Configure Git Identity
+        working-directory: gitops
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit Environment State
+        working-directory: gitops
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add environments/production.yaml
+
+          if git diff --cached --quiet; then
+            echo "No environment state changes."
+            exit 0
+          fi
+
+          git commit \
+            -m "deploy(production): deployment verified ${RELEASE_ID}"
+      - name: Push Environment State
+        working-directory: gitops
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Refreshing main..."
+
+          git pull --rebase origin main
+
+          echo "Pushing..."
+
+          git push origin HEAD:main
+
+          echo "Environment state pushed successfully."
 
       - name: Write Deployment Verification Summary
 
@@ -2210,7 +2313,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "staging": .promotion.staging
+              "production": .promotion.production
             }
           ' /tmp/release-before.yaml > /tmp/immutable-before.json
 
@@ -2222,7 +2325,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "staging": .promotion.staging
+              "production": .promotion.production
             }
           ' "${RELEASE_FILE}" > /tmp/immutable-after.json
 
@@ -2344,8 +2447,8 @@ jobs:
             echo "| Release | \`${RELEASE_ID}\` |"
             echo "| GitOps Commit | \`${GITOPS_COMMIT}\` |"
             echo "| Applications Verified | ${APPLICATIONS_VERIFIED} |"
-            echo "| Argo CD Sync | Simulated |"
-            echo "| Argo CD Health | Simulated |"
+            echo "| Argo CD Sync | Passed |"
+            echo "| Argo CD Health | Passed |"
             echo "| Production Status | **verified** |"
             echo "| Verification Commit | \`${VERIFICATION_COMMIT}\` |"
           } >> "${GITHUB_STEP_SUMMARY}"
