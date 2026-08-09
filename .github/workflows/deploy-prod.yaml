@@ -1557,6 +1557,7 @@ jobs:
           export ACTOR
 
           yq -i '
+            .promotion.production.eligible = true |
             .promotion.production.status = "gitops-updated" |
             .promotion.production.updatedAt = strenv(UPDATED_AT) |
             .promotion.production.gitopsCommit = strenv(GITOPS_COMMIT) |
@@ -1649,7 +1650,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "production": .promotion.production
+              "staging": .promotion.staging
             }
           ' /tmp/release-before.yaml > /tmp/immutable-before.json
 
@@ -1661,7 +1662,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "production": .promotion.production
+              "staging": .promotion.staging
             }
           ' "${RELEASE_FILE}" > /tmp/immutable-after.json
 
@@ -2313,7 +2314,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "production": .promotion.production
+              "staging": .promotion.staging
             }
           ' /tmp/release-before.yaml > /tmp/immutable-before.json
 
@@ -2325,7 +2326,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "production": .promotion.production
+              "staging": .promotion.staging
             }
           ' "${RELEASE_FILE}" > /tmp/immutable-after.json
 
