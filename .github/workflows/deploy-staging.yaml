@@ -2575,6 +2575,7 @@ jobs:
           export SMOKE_TEST_STATUS
 
           yq -i '
+            .promotion.production.eligible = true |
             .promotion.staging.status = "verified" |
             .promotion.staging.verifiedAt = strenv(VERIFIED_AT) |
             .promotion.staging.verificationWorkflowRunId = strenv(VERIFICATION_RUN_ID) |
