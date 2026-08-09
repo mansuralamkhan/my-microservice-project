@@ -1617,9 +1617,11 @@ jobs:
           fi
 
           CURRENT_RELEASE=$(yq -r '.currentRelease' "${STATE_FILE}")
+          CURRENT_GITOPS_COMMIT=$(yq -r '.currentGitopsCommit' "${STATE_FILE}")
 
           export RELEASE_ID
           export CURRENT_RELEASE
+          export CURRENT_GITOPS_COMMIT
 
           yq -i '
             .desiredRelease = strenv(RELEASE_ID) |
@@ -1628,7 +1630,9 @@ jobs:
               (strenv(CURRENT_RELEASE) != "") and
               (strenv(CURRENT_RELEASE) != strenv(RELEASE_ID))
             ) |
-            .rollback.target = strenv(CURRENT_RELEASE)
+            .rollback.target.release = strenv(CURRENT_RELEASE) |
+            .rollback.target.gitopsCommit = strenv(CURRENT_GITOPS_COMMIT)
+
           ' "${STATE_FILE}"
 
           echo "Environment state updated."
@@ -3115,9 +3119,11 @@ jobs:
           fi
 
           export RELEASE_ID
+          export GITOPS_COMMIT
 
           yq -i '
             .currentRelease = strenv(RELEASE_ID) |
+            .currentGitopsCommit = strenv(GITOPS_COMMIT) |
             .desiredRelease = strenv(RELEASE_ID) |
             .status = "healthy" |
             .lastSuccessfulDeployment = strenv(RELEASE_ID)
