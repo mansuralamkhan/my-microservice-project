@@ -2647,7 +2647,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "production": .promotion.production
+              "production": (.promotion.production | del(.eligible))
             }
           ' /tmp/release-before.yaml > /tmp/immutable-before.json
 
@@ -2659,7 +2659,7 @@ jobs:
               "ci": .ci,
               "images": .images,
               "development": .promotion.development,
-              "production": .promotion.production
+              "production": (.promotion.production | del(.eligible))
             }
           ' "${RELEASE_FILE}" > /tmp/immutable-after.json
 
