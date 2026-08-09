@@ -1096,6 +1096,8 @@ jobs:
 
           CURRENT_RELEASE=$(yq -r '.currentRelease' "${STATE_FILE}")
 
+          CURRENT_GITOPS_COMMIT=$(yq -r '.gitopsCommit' "${STATE_FILE}")
+
           export RELEASE_ID
           export CURRENT_RELEASE
 
@@ -2001,6 +2003,8 @@ jobs:
 
           yq -i '
             .currentRelease = strenv(RELEASE_ID) |
+            .gitopsCommit = strenv(GITOPS_COMMIT) |
+
             .desiredRelease = strenv(RELEASE_ID) |
             .status = "healthy" |
             .lastSuccessfulDeployment = strenv(RELEASE_ID)
