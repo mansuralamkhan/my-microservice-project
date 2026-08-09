@@ -2,7 +2,6 @@ package com.example;
 
 public class App {
     public static void main(String[] args) {
-
-        System.out.println("ss froddd..m,,mhellomm....m,, Dockmmer!");
-
+        System.out.println("Helvvlddo ddk.hsddfsroam Docker!");
+    }
 }
