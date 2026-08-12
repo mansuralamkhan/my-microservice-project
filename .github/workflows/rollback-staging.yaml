@@ -189,7 +189,7 @@ jobs:
           repository: ${{ vars.GITOPS_REPOSITORY }}
           token: ${{ secrets.GITOPS_TOKEN }}
           ref: main
-          path: release-registry
+          path: release
           fetch-depth: 1
           persist-credentials: false
 
