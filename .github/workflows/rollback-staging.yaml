@@ -195,7 +195,7 @@ jobs:
 
       - name: Install yq
 
-        shell: bashgit 
+        shell: bash
 
         run: |
           set -euo pipefail
