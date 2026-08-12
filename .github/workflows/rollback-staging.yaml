@@ -1,0 +1,743 @@
+name: Staging Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "rollback" to confirm you want to revert Staging to the last known-good release'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: staging-release-promotion
+  cancel-in-progress: false
+
+env:
+  RELEASE_REGISTRY_PATH: releases
+  RELEASE_SCHEMA_VERSION: "1.1"
+
+jobs:
+
+  resolve-rollback-target:
+
+    name: Resolve Rollback Target
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
+    outputs:
+      rollback-target: ${{ steps.resolve.outputs.rollback-target }}
+      current-release: ${{ steps.resolve.outputs.current-release }}
+
+    steps:
+
+      - name: Validate Confirmation Input
+
+        env:
+          CONFIRM_INPUT: ${{ inputs.confirm }}
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          if [[ "${CONFIRM_INPUT}" != "rollback" ]]; then
+            echo "ERROR: Confirmation phrase did not match. Type 'rollback' to proceed."
+            exit 1
+          fi
+
+          echo "Rollback confirmed by operator."
+
+      - name: Checkout GitOps Repository
+
+        uses: actions/checkout@v4
+
+        with:
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          ref: main
+          path: gitops
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install yq
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+          YQ_VERSION="v4.44.3"
+          sudo wget \
+            --quiet \
+            --output-document=/usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Resolve Rollback Target From Environment State
+
+        id: resolve
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          STATE_FILE="gitops/environments/staging.yaml"
+
+          echo "=========================================="
+          echo "Resolving rollback target"
+          echo "=========================================="
+
+          if [[ ! -s "${STATE_FILE}" ]]; then
+            echo "ERROR: Staging environment state file is missing."
+            exit 1
+          fi
+
+          # This is intentionally the SOLE source of truth for rollback eligibility.
+          # We do not consult releases/<id>/release.yaml here: the registry is an
+          # audit log written by a separate job/commit and can legitimately lag
+          # or fail to update even after a deployment has genuinely succeeded.
+          # Gating an operational safety action on the audit trail being perfectly
+          # in sync would make rollback unreliable exactly when it's needed most.
+
+          ROLLBACK_AVAILABLE=$(yq -r '.rollback.available' "${STATE_FILE}")
+          ROLLBACK_TARGET=$(yq -r '.rollback.target' "${STATE_FILE}")
+          CURRENT_RELEASE=$(yq -r '.currentRelease' "${STATE_FILE}")
+
+          if [[ "${ROLLBACK_AVAILABLE}" != "true" ]]; then
+            echo "ERROR: No rollback target is currently recorded for Staging."
+            echo "This can mean: no prior successful deployment exists, or a"
+            echo "rollback was already consumed and not yet followed by a new"
+            echo "successful promotion."
+            exit 1
+          fi
+
+          if [[ -z "${ROLLBACK_TARGET}" || "${ROLLBACK_TARGET}" == "null" ]]; then
+            echo "ERROR: rollback.target is empty despite rollback.available=true."
+            echo "Environment state file is inconsistent; refusing to proceed."
+            exit 1
+          fi
+
+          if [[ ! "${ROLLBACK_TARGET}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "ERROR: rollback.target is not a valid 40-character Git SHA."
+            exit 1
+          fi
+
+          if [[ "${ROLLBACK_TARGET}" == "${CURRENT_RELEASE}" ]]; then
+            echo "ERROR: rollback.target is identical to the currently deployed release."
+            echo "Refusing a no-op rollback."
+            exit 1
+          fi
+
+          {
+            echo "rollback-target=${ROLLBACK_TARGET}"
+            echo "current-release=${CURRENT_RELEASE}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Currently deployed release : ${CURRENT_RELEASE}"
+          echo "Rollback target release    : ${ROLLBACK_TARGET}"
+
+      - name: Write Resolution Summary
+
+        env:
+          ROLLBACK_TARGET: ${{ steps.resolve.outputs.rollback-target }}
+          CURRENT_RELEASE: ${{ steps.resolve.outputs.current-release }}
+
+        shell: bash
+
+        run: |
+          {
+            echo "## Staging Rollback: Target Resolved"
+            echo ""
+            echo "| Attribute | Value |"
+            echo "|---|---|"
+            echo "| Currently Deployed Release | \`${CURRENT_RELEASE}\` |"
+            echo "| Rollback Target Release | \`${ROLLBACK_TARGET}\` |"
+            echo "| Source | environments/staging.yaml (deployment state, not registry) |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  validate-rollback-target:
+
+    name: Validate Rollback Target Release
+
+    needs:
+      - resolve-rollback-target
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
+    env:
+      ROLLBACK_TARGET: ${{ needs.resolve-rollback-target.outputs.rollback-target }}
+
+    outputs:
+      image-count: ${{ steps.validate.outputs.image-count }}
+
+    steps:
+
+      - name: Checkout Release Registry
+
+        uses: actions/checkout@v4
+
+        with:
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          ref: main
+          path: release-registry
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install yq
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+          YQ_VERSION="v4.44.3"
+          sudo wget \
+            --quiet \
+            --output-document=/usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Validate Rollback Target Is A Well-Formed Release
+
+        id: validate
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          RELEASE_FILE="release/${RELEASE_REGISTRY_PATH}/${ROLLBACK_TARGET}/release.yaml"
+
+          echo "=========================================="
+          echo "Validating rollback target release record"
+          echo "=========================================="
+          echo "Target: ${ROLLBACK_TARGET}"
+          echo ""
+
+          # Deliberately NOT checked here: promotion.staging.status.
+          # A release that was successfully deployed in the past will very
+          # likely show status "verified" already (it got here honestly),
+          # but we do not require any particular value. Rollback answers
+          # "was this a real, valid release we can safely redeploy" -- a
+          # question about the past -- not "is this eligible to move
+          # forward," which is what the promotion workflow's gates answer.
+          # Coupling the two caused the exact failure mode this workflow
+          # exists to recover from.
+
+          if [[ ! -s "${RELEASE_FILE}" ]]; then
+            echo "ERROR: Rollback target release record does not exist."
+            echo "Expected: ${RELEASE_FILE}"
+            exit 1
+          fi
+
+          SCHEMA_VERSION=$(yq -r '.schemaVersion' "${RELEASE_FILE}")
+
+          if [[ "${SCHEMA_VERSION}" != "${RELEASE_SCHEMA_VERSION}" ]]; then
+            echo "ERROR: Unsupported release schema on rollback target."
+            echo "Expected: ${RELEASE_SCHEMA_VERSION}"
+            echo "Actual  : ${SCHEMA_VERSION}"
+            exit 1
+          fi
+
+          REGISTERED_RELEASE_ID=$(yq -r '.release.id' "${RELEASE_FILE}")
+
+          if [[ "${REGISTERED_RELEASE_ID}" != "${ROLLBACK_TARGET}" ]]; then
+            echo "ERROR: Release record identity mismatch."
+            exit 1
+          fi
+
+          IMAGE_COUNT=$(yq '.images | length' "${RELEASE_FILE}")
+
+          if [[ ! "${IMAGE_COUNT}" =~ ^[0-9]+$ ]] || (( IMAGE_COUNT < 1 )); then
+            echo "ERROR: Rollback target release contains no deployable images."
+            exit 1
+          fi
+
+          while IFS= read -r SERVICE
+          do
+            REPOSITORY=$(SERVICE="${SERVICE}" yq -r '.images[strenv(SERVICE)].repository' "${RELEASE_FILE}")
+            TAG=$(SERVICE="${SERVICE}" yq -r '.images[strenv(SERVICE)].tag' "${RELEASE_FILE}")
+            DIGEST=$(SERVICE="${SERVICE}" yq -r '.images[strenv(SERVICE)].digest' "${RELEASE_FILE}")
+
+            if [[ -z "${REPOSITORY}" || "${REPOSITORY}" == "null" ]]; then
+              echo "ERROR: Missing repository for ${SERVICE} on rollback target."
+              exit 1
+            fi
+
+            if [[ -z "${TAG}" || "${TAG}" == "null" ]]; then
+              echo "ERROR: Missing tag for ${SERVICE} on rollback target."
+              exit 1
+            fi
+
+            if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+              echo "ERROR: Invalid digest for ${SERVICE} on rollback target."
+              exit 1
+            fi
+
+            echo "Validated rollback metadata for ${SERVICE}."
+
+          done < <(yq -r '.images | keys | .[]' "${RELEASE_FILE}")
+
+          echo "image-count=${IMAGE_COUNT}" >> "${GITHUB_OUTPUT}"
+
+          echo ""
+          echo "Rollback target release is well-formed."
+          echo ""
+          echo "NOTE (future improvement): this only validates structure. It"
+          echo "does not re-verify ECR digest presence or Cosign signatures"
+          echo "the way the promotion workflow does. Since these images were"
+          echo "already deployed successfully before, this is a reasonable"
+          echo "v1 tradeoff -- but re-adding that check closes a real gap"
+          echo "(e.g. a since-deleted or since-revoked image)."
+
+  apply-rollback:
+
+    name: Apply Staging Rollback
+
+    needs:
+      - resolve-rollback-target
+      - validate-rollback-target
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 15
+
+    environment:
+      name: staging
+
+    env:
+      ROLLBACK_TARGET: ${{ needs.resolve-rollback-target.outputs.rollback-target }}
+      PREVIOUS_CURRENT_RELEASE: ${{ needs.resolve-rollback-target.outputs.current-release }}
+      EXPECTED_IMAGE_COUNT: ${{ needs.validate-rollback-target.outputs.image-count }}
+
+    outputs:
+      rollback-target: ${{ steps.apply.outputs.rollback-target }}
+      gitops-commit: ${{ steps.push.outputs.gitops-commit }}
+
+    steps:
+
+      - name: Checkout Writable GitOps Repository
+
+        uses: actions/checkout@v4
+
+        with:
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          ref: main
+          path: gitops
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Checkout Release Registry
+
+        uses: actions/checkout@v4
+
+        with:
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          ref: main
+          path: release-registry
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install yq
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+          YQ_VERSION="v4.44.3"
+          sudo wget \
+            --quiet \
+            --output-document=/usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Revert Services To Rollback Target Images
+
+        id: apply
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          RELEASE_FILE="release/${RELEASE_REGISTRY_PATH}/${ROLLBACK_TARGET}/release.yaml"
+
+          UPDATED_COUNT=0
+
+          echo "=========================================="
+          echo "Reverting Staging to ${ROLLBACK_TARGET}"
+          echo "=========================================="
+
+          while IFS= read -r SERVICE
+          do
+            echo "------------------------------------------"
+            echo "Service: ${SERVICE}"
+            echo "------------------------------------------"
+
+            REPOSITORY=$(SERVICE="${SERVICE}" yq -r '.images[strenv(SERVICE)].repository' "${RELEASE_FILE}")
+            TAG=$(SERVICE="${SERVICE}" yq -r '.images[strenv(SERVICE)].tag' "${RELEASE_FILE}")
+            DIGEST=$(SERVICE="${SERVICE}" yq -r '.images[strenv(SERVICE)].digest' "${RELEASE_FILE}")
+
+            VALUES_FILE="gitops/applications/${SERVICE}/environments/staging/values.yaml"
+
+            if [[ ! -f "${VALUES_FILE}" ]]; then
+              echo "ERROR: Staging values file does not exist for ${SERVICE}."
+              exit 1
+            fi
+
+            export REPOSITORY
+            export TAG
+            export DIGEST
+
+            yq -i '
+              .image.repository = strenv(REPOSITORY) |
+              .image.tag = strenv(TAG) |
+              .image.digest = strenv(DIGEST)
+            ' "${VALUES_FILE}"
+
+            ACTUAL_DIGEST=$(yq -r '.image.digest' "${VALUES_FILE}")
+
+            if [[ "${ACTUAL_DIGEST}" != "${DIGEST}" ]]; then
+              echo "ERROR: Digest revert failed for ${SERVICE}."
+              exit 1
+            fi
+
+            UPDATED_COUNT=$((UPDATED_COUNT + 1))
+
+            echo "${SERVICE}: reverted to ${DIGEST}"
+
+          done < <(yq -r '.images | keys | .[]' "${RELEASE_FILE}")
+
+          if (( UPDATED_COUNT != EXPECTED_IMAGE_COUNT )); then
+            echo "ERROR: Revert count does not match expected image count."
+            exit 1
+          fi
+
+          echo "rollback-target=${ROLLBACK_TARGET}" >> "${GITHUB_OUTPUT}"
+
+          echo ""
+          echo "All services reverted."
+
+      - name: Update Environment State For Rollback
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          STATE_FILE="gitops/environments/staging.yaml"
+
+          export ROLLBACK_TARGET
+
+          # rollback.available is deliberately set to false with an empty
+          # target: v1 does not support "rollback the rollback." If this
+          # revert also turns out unhealthy, that is a new incident that
+          # needs a human, not an automatic second hop. See conversation
+          # notes: chaining/history is a named future improvement.
+
+          yq -i '
+            .currentRelease = strenv(ROLLBACK_TARGET) |
+            .desiredRelease = strenv(ROLLBACK_TARGET) |
+            .status = "rolled-back" |
+            .lastSuccessfulDeployment = strenv(ROLLBACK_TARGET) |
+            .rollback.available = false |
+            .rollback.target = ""
+          ' "${STATE_FILE}"
+
+          echo "Environment state updated for rollback."
+          cat "${STATE_FILE}"
+
+      - name: Validate GitOps Change Scope
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          CHANGED_FILES=$(git diff --name-only)
+
+          if [[ -z "${CHANGED_FILES}" ]]; then
+            echo "ERROR: Rollback produced no GitOps changes."
+            echo "Staging may already be at the rollback target."
+            exit 1
+          fi
+
+          INVALID_CHANGE=false
+
+          while IFS= read -r FILE
+          do
+            [[ -z "${FILE}" ]] && continue
+
+            if [[ "${FILE}" =~ ^applications/[^/]+/environments/staging/values\.yaml$ ]] ||
+               [[ "${FILE}" == "environments/staging.yaml" ]]; then
+                echo "Allowed change: ${FILE}"
+            else
+                echo "ERROR: Unauthorized GitOps change: ${FILE}"
+                INVALID_CHANGE=true
+            fi
+          done <<< "${CHANGED_FILES}"
+
+          if [[ "${INVALID_CHANGE}" == "true" ]]; then
+            exit 1
+          fi
+
+      - name: Configure Git Identity
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit Rollback
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          git add -- \
+            'applications/*/environments/staging/values.yaml' \
+            'environments/staging.yaml'
+
+          if git diff --cached --quiet; then
+            echo "ERROR: No rollback changes were staged."
+            exit 1
+          fi
+
+          git commit \
+            -m "rollback(staging): revert to release ${ROLLBACK_TARGET}" \
+            -m "Reverted from: ${PREVIOUS_CURRENT_RELEASE}"
+
+      - name: Push Rollback (with retry)
+
+        id: push
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          # This is the fix for the push-race we identified: concurrency.group
+          # only serializes runs of THIS workflow against itself. A promotion
+          # or another rollback in a different workflow can still push to the
+          # same gitops main in between our pull and our push. A bare push
+          # here would die permanently on the first collision with no retry.
+          # This loop re-pulls and re-applies our already-committed change
+          # on top of whatever main has become, then retries the push.
+
+          MAX_ATTEMPTS=5
+          ATTEMPT=1
+
+          while (( ATTEMPT <= MAX_ATTEMPTS ))
+          do
+            echo "Push attempt ${ATTEMPT}/${MAX_ATTEMPTS}..."
+
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              GITOPS_COMMIT=$(git rev-parse HEAD)
+              echo "gitops-commit=${GITOPS_COMMIT}" >> "${GITHUB_OUTPUT}"
+              echo "Rollback pushed successfully on attempt ${ATTEMPT}."
+              echo "Commit: ${GITOPS_COMMIT}"
+              exit 0
+            fi
+
+            echo "Push attempt ${ATTEMPT} failed (main moved concurrently)."
+
+            if (( ATTEMPT == MAX_ATTEMPTS )); then
+              echo "ERROR: Exhausted retries pushing rollback to main."
+              echo "The rollback deployment change was NOT applied."
+              exit 1
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+
+            sleep $(( (RANDOM % 4) + 1 ))
+          done
+
+      - name: Verify Rollback Push
+
+        working-directory: gitops
+
+        env:
+          EXPECTED_COMMIT: ${{ steps.push.outputs.gitops-commit }}
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          git fetch origin main
+
+          if ! git merge-base --is-ancestor "${EXPECTED_COMMIT}" "origin/main"; then
+            echo "ERROR: Rollback commit is not present on GitOps main."
+            exit 1
+          fi
+
+          echo "Rollback commit confirmed on remote main."
+
+      - name: Write Rollback Summary
+
+        env:
+          GITOPS_COMMIT: ${{ steps.push.outputs.gitops-commit }}
+
+        shell: bash
+
+        run: |
+          {
+            echo "# Staging Rollback Applied"
+            echo ""
+            echo "| Attribute | Value |"
+            echo "|---|---|"
+            echo "| Reverted From | \`${PREVIOUS_CURRENT_RELEASE}\` |"
+            echo "| Reverted To | \`${ROLLBACK_TARGET}\` |"
+            echo "| GitOps Commit | \`${GITOPS_COMMIT}\` |"
+            echo "| Rollback Chaining | Not available until next successful promotion |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  record-rollback-in-registry:
+
+    name: Record Rollback (Audit Only, Non-Blocking)
+
+    needs:
+      - resolve-rollback-target
+      - apply-rollback
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 5
+
+    # Deliberately no `environment: staging` gate here -- the deployment
+    # already happened in apply-rollback. This job is bookkeeping, not
+    # an action. It is also allowed to fail without failing the workflow
+    # (continue-on-error below): a registry write race here should never
+    # be interpreted as "the rollback didn't happen." If it fails, fix
+    # the registry by hand or on the next promotion -- do not re-run
+    # this whole workflow to retry it.
+
+    continue-on-error: true
+
+    env:
+      ROLLBACK_TARGET: ${{ needs.resolve-rollback-target.outputs.rollback-target }}
+      PREVIOUS_CURRENT_RELEASE: ${{ needs.resolve-rollback-target.outputs.current-release }}
+
+    steps:
+
+      - name: Checkout Registry
+
+        uses: actions/checkout@v4
+
+        with:
+          repository: ${{ vars.GITOPS_REPOSITORY }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          ref: main
+          path: gitops
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install yq
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+          YQ_VERSION="v4.44.3"
+          sudo wget \
+            --quiet \
+            --output-document=/usr/local/bin/yq \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Mark Previous Release As Rolled Back
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          RELEASE_FILE="gitops/${RELEASE_REGISTRY_PATH}/${PREVIOUS_CURRENT_RELEASE}/release.yaml"
+
+          if [[ ! -s "${RELEASE_FILE}" ]]; then
+            echo "WARNING: Previous release record not found, skipping annotation."
+            exit 0
+          fi
+
+          ROLLED_BACK_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          export ROLLED_BACK_AT
+          export ROLLBACK_TARGET
+
+          yq -i '
+            .promotion.staging.status = "rolled-back" |
+            .promotion.staging.rolledBackAt = strenv(ROLLED_BACK_AT) |
+            .promotion.staging.rolledBackTo = strenv(ROLLBACK_TARGET)
+          ' "${RELEASE_FILE}"
+
+          echo "Annotated ${PREVIOUS_CURRENT_RELEASE} as rolled-back."
+
+      - name: Configure Git Identity
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit And Push (best-effort, with retry)
+
+        working-directory: gitops
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          RELEASE_FILE="${RELEASE_REGISTRY_PATH}/${PREVIOUS_CURRENT_RELEASE}/release.yaml"
+
+          git add -- "${RELEASE_FILE}" || true
+
+          if git diff --cached --quiet; then
+            echo "No registry changes to commit; skipping."
+            exit 0
+          fi
+
+          git commit -m "release: mark ${PREVIOUS_CURRENT_RELEASE} rolled-back to ${ROLLBACK_TARGET}"
+
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
+
+          while (( ATTEMPT <= MAX_ATTEMPTS ))
+          do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              echo "Registry annotation pushed."
+              exit 0
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep $(( (RANDOM % 3) + 1 ))
+          done
+
+          echo "WARNING: Could not push registry annotation after retries."
+          echo "Deployment rollback already succeeded and is unaffected."
+          exit 0
