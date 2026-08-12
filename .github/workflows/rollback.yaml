@@ -1,10 +1,17 @@
-name: Staging Rollback
+name: Release Rollback
 
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: "Environment to roll back"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
       confirm:
-        description: 'Type "rollback" to confirm you want to revert Staging to the last known-good release'
+        description: 'Type "rollback" to confirm you want to revert the selected environment to its last known-good release'
         required: true
         type: string
 
@@ -13,7 +20,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: staging-release-promotion
+  group: ${{ inputs.environment }}-release-promotion
   cancel-in-progress: false
 
 env:
@@ -33,13 +40,15 @@ jobs:
     outputs:
       rollback-target: ${{ steps.resolve.outputs.rollback-target }}
       current-release: ${{ steps.resolve.outputs.current-release }}
+      values-dir: ${{ steps.env-map.outputs.values-dir }}
 
     steps:
 
-      - name: Validate Confirmation Input
+      - name: Validate Inputs
 
         env:
           CONFIRM_INPUT: ${{ inputs.confirm }}
+          ENVIRONMENT: ${{ inputs.environment }}
 
         shell: bash
 
@@ -51,7 +60,53 @@ jobs:
             exit 1
           fi
 
-          echo "Rollback confirmed by operator."
+          # Defense in depth: 'choice' restricts the UI dropdown, but
+          # workflow_dispatch can also be triggered via the API with an
+          # arbitrary string for this input. Never trust it implicitly.
+          case "${ENVIRONMENT}" in
+            staging|production) ;;
+            *)
+              echo "ERROR: Unsupported environment '${ENVIRONMENT}'."
+              echo "Rollback is only supported for: staging, production."
+              exit 1
+              ;;
+          esac
+
+          echo "Rollback confirmed by operator for environment: ${ENVIRONMENT}"
+
+      - name: Resolve Environment-Specific Naming
+
+        id: env-map
+
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+
+        shell: bash
+
+        run: |
+          set -euo pipefail
+
+          # NOTE (known inconsistency, not a bug): the GitOps repo names the
+          # values.yaml directory "staging" for staging but "prod" for
+          # production -- inherited from an earlier explicit request, not
+          # accidental. environments/<env>.yaml and .promotion.<env>,
+          # however, DO match `inputs.environment` directly. This mapping
+          # isolates the one inconsistent case so nothing downstream has
+          # to special-case it. Worth normalizing at the source (rename
+          # the "prod" directory to "production") the next time someone
+          # is touching the GitOps repo layout directly.
+
+          case "${ENVIRONMENT}" in
+            staging)
+              VALUES_DIR="staging"
+              ;;
+            production)
+              VALUES_DIR="prod"
+              ;;
+          esac
+
+          echo "values-dir=${VALUES_DIR}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved values directory for ${ENVIRONMENT}: ${VALUES_DIR}"
 
       - name: Checkout GitOps Repository
 
@@ -83,35 +138,39 @@ jobs:
 
         id: resolve
 
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+
         shell: bash
 
         run: |
           set -euo pipefail
 
-          STATE_FILE="gitops/environments/staging.yaml"
+          STATE_FILE="gitops/environments/${ENVIRONMENT}.yaml"
 
           echo "=========================================="
-          echo "Resolving rollback target"
+          echo "Resolving rollback target for ${ENVIRONMENT}"
           echo "=========================================="
 
           if [[ ! -s "${STATE_FILE}" ]]; then
-            echo "ERROR: Staging environment state file is missing."
+            echo "ERROR: ${ENVIRONMENT} environment state file is missing."
             exit 1
           fi
 
-          # This is intentionally the SOLE source of truth for rollback eligibility.
-          # We do not consult releases/<id>/release.yaml here: the registry is an
-          # audit log written by a separate job/commit and can legitimately lag
-          # or fail to update even after a deployment has genuinely succeeded.
-          # Gating an operational safety action on the audit trail being perfectly
-          # in sync would make rollback unreliable exactly when it's needed most.
+          # Sole source of truth for rollback eligibility. We deliberately
+          # do not consult releases/<id>/release.yaml here: that registry
+          # is an audit log written by a separate job/commit and can
+          # legitimately lag or fail to update even after a deployment has
+          # genuinely succeeded. Gating an operational safety action on the
+          # audit trail being perfectly in sync would make rollback
+          # unreliable exactly when it's needed most.
 
           ROLLBACK_AVAILABLE=$(yq -r '.rollback.available' "${STATE_FILE}")
           ROLLBACK_TARGET=$(yq -r '.rollback.target' "${STATE_FILE}")
           CURRENT_RELEASE=$(yq -r '.currentRelease' "${STATE_FILE}")
 
           if [[ "${ROLLBACK_AVAILABLE}" != "true" ]]; then
-            echo "ERROR: No rollback target is currently recorded for Staging."
+            echo "ERROR: No rollback target is currently recorded for ${ENVIRONMENT}."
             echo "This can mean: no prior successful deployment exists, or a"
             echo "rollback was already consumed and not yet followed by a new"
             echo "successful promotion."
@@ -146,6 +205,7 @@ jobs:
       - name: Write Resolution Summary
 
         env:
+          ENVIRONMENT: ${{ inputs.environment }}
           ROLLBACK_TARGET: ${{ steps.resolve.outputs.rollback-target }}
           CURRENT_RELEASE: ${{ steps.resolve.outputs.current-release }}
 
@@ -153,13 +213,14 @@ jobs:
 
         run: |
           {
-            echo "## Staging Rollback: Target Resolved"
+            echo "## ${ENVIRONMENT} Rollback: Target Resolved"
             echo ""
             echo "| Attribute | Value |"
             echo "|---|---|"
+            echo "| Environment | \`${ENVIRONMENT}\` |"
             echo "| Currently Deployed Release | \`${CURRENT_RELEASE}\` |"
             echo "| Rollback Target Release | \`${ROLLBACK_TARGET}\` |"
-            echo "| Source | environments/staging.yaml (deployment state, not registry) |"
+            echo "| Source | environments/${ENVIRONMENT}.yaml (deployment state, not registry) |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
   validate-rollback-target:
@@ -174,6 +235,7 @@ jobs:
     timeout-minutes: 10
 
     env:
+      ENVIRONMENT: ${{ inputs.environment }}
       ROLLBACK_TARGET: ${{ needs.resolve-rollback-target.outputs.rollback-target }}
 
     outputs:
@@ -189,7 +251,7 @@ jobs:
           repository: ${{ vars.GITOPS_REPOSITORY }}
           token: ${{ secrets.GITOPS_TOKEN }}
           ref: main
-          path: release
+          path: release-registry
           fetch-depth: 1
           persist-credentials: false
 
@@ -216,23 +278,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          RELEASE_FILE="release/${RELEASE_REGISTRY_PATH}/${ROLLBACK_TARGET}/release.yaml"
+          RELEASE_FILE="release-registry/${RELEASE_REGISTRY_PATH}/${ROLLBACK_TARGET}/release.yaml"
 
           echo "=========================================="
           echo "Validating rollback target release record"
           echo "=========================================="
-          echo "Target: ${ROLLBACK_TARGET}"
+          echo "Environment : ${ENVIRONMENT}"
+          echo "Target      : ${ROLLBACK_TARGET}"
           echo ""
 
-          # Deliberately NOT checked here: promotion.staging.status.
-          # A release that was successfully deployed in the past will very
-          # likely show status "verified" already (it got here honestly),
-          # but we do not require any particular value. Rollback answers
-          # "was this a real, valid release we can safely redeploy" -- a
-          # question about the past -- not "is this eligible to move
-          # forward," which is what the promotion workflow's gates answer.
-          # Coupling the two caused the exact failure mode this workflow
-          # exists to recover from.
+          # Deliberately NOT checked here: promotion.<environment>.status.
+          # Rollback answers "was this a real, valid release we can safely
+          # redeploy" -- a question about the past -- not "is this eligible
+          # to move forward," which is what the promotion workflow's gates
+          # answer. Coupling the two caused the exact failure mode this
+          # workflow exists to recover from.
 
           if [[ ! -s "${RELEASE_FILE}" ]]; then
             echo "ERROR: Rollback target release record does not exist."
@@ -295,14 +355,11 @@ jobs:
           echo ""
           echo "NOTE (future improvement): this only validates structure. It"
           echo "does not re-verify ECR digest presence or Cosign signatures"
-          echo "the way the promotion workflow does. Since these images were"
-          echo "already deployed successfully before, this is a reasonable"
-          echo "v1 tradeoff -- but re-adding that check closes a real gap"
-          echo "(e.g. a since-deleted or since-revoked image)."
+          echo "the way the promotion workflow does."
 
   apply-rollback:
 
-    name: Apply Staging Rollback
+    name: Apply Rollback
 
     needs:
       - resolve-rollback-target
@@ -313,9 +370,11 @@ jobs:
     timeout-minutes: 15
 
     environment:
-      name: staging
+      name: ${{ inputs.environment }}
 
     env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      VALUES_DIR: ${{ needs.resolve-rollback-target.outputs.values-dir }}
       ROLLBACK_TARGET: ${{ needs.resolve-rollback-target.outputs.rollback-target }}
       PREVIOUS_CURRENT_RELEASE: ${{ needs.resolve-rollback-target.outputs.current-release }}
       EXPECTED_IMAGE_COUNT: ${{ needs.validate-rollback-target.outputs.image-count }}
@@ -346,7 +405,7 @@ jobs:
           repository: ${{ vars.GITOPS_REPOSITORY }}
           token: ${{ secrets.GITOPS_TOKEN }}
           ref: main
-          path: release
+          path: release-registry
           fetch-depth: 1
           persist-credentials: false
 
@@ -373,12 +432,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          RELEASE_FILE="release/${RELEASE_REGISTRY_PATH}/${ROLLBACK_TARGET}/release.yaml"
+          RELEASE_FILE="release-registry/${RELEASE_REGISTRY_PATH}/${ROLLBACK_TARGET}/release.yaml"
 
           UPDATED_COUNT=0
 
           echo "=========================================="
-          echo "Reverting Staging to ${ROLLBACK_TARGET}"
+          echo "Reverting ${ENVIRONMENT} to ${ROLLBACK_TARGET}"
           echo "=========================================="
 
           while IFS= read -r SERVICE
@@ -391,10 +450,11 @@ jobs:
             TAG=$(SERVICE="${SERVICE}" yq -r '.images[strenv(SERVICE)].tag' "${RELEASE_FILE}")
             DIGEST=$(SERVICE="${SERVICE}" yq -r '.images[strenv(SERVICE)].digest' "${RELEASE_FILE}")
 
-            VALUES_FILE="gitops/applications/${SERVICE}/environments/staging/values.yaml"
+            VALUES_FILE="gitops/applications/${SERVICE}/environments/${VALUES_DIR}/values.yaml"
 
             if [[ ! -f "${VALUES_FILE}" ]]; then
-              echo "ERROR: Staging values file does not exist for ${SERVICE}."
+              echo "ERROR: ${ENVIRONMENT} values file does not exist for ${SERVICE}."
+              echo "Expected: ${VALUES_FILE}"
               exit 1
             fi
 
@@ -438,15 +498,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          STATE_FILE="gitops/environments/staging.yaml"
+          STATE_FILE="gitops/environments/${ENVIRONMENT}.yaml"
 
           export ROLLBACK_TARGET
 
           # rollback.available is deliberately set to false with an empty
           # target: v1 does not support "rollback the rollback." If this
           # revert also turns out unhealthy, that is a new incident that
-          # needs a human, not an automatic second hop. See conversation
-          # notes: chaining/history is a named future improvement.
+          # needs a human, not an automatic second hop.
 
           yq -i '
             .currentRelease = strenv(ROLLBACK_TARGET) |
@@ -473,9 +532,12 @@ jobs:
 
           if [[ -z "${CHANGED_FILES}" ]]; then
             echo "ERROR: Rollback produced no GitOps changes."
-            echo "Staging may already be at the rollback target."
+            echo "${ENVIRONMENT} may already be at the rollback target."
             exit 1
           fi
+
+          VALUES_REGEX="^applications/[^/]+/environments/${VALUES_DIR}/values\\.yaml\$"
+          STATE_FILE_REL="environments/${ENVIRONMENT}.yaml"
 
           INVALID_CHANGE=false
 
@@ -483,8 +545,7 @@ jobs:
           do
             [[ -z "${FILE}" ]] && continue
 
-            if [[ "${FILE}" =~ ^applications/[^/]+/environments/staging/values\.yaml$ ]] ||
-               [[ "${FILE}" == "environments/staging.yaml" ]]; then
+            if [[ "${FILE}" =~ ${VALUES_REGEX} ]] || [[ "${FILE}" == "${STATE_FILE_REL}" ]]; then
                 echo "Allowed change: ${FILE}"
             else
                 echo "ERROR: Unauthorized GitOps change: ${FILE}"
@@ -516,8 +577,8 @@ jobs:
           set -euo pipefail
 
           git add -- \
-            'applications/*/environments/staging/values.yaml' \
-            'environments/staging.yaml'
+            "applications/*/environments/${VALUES_DIR}/values.yaml" \
+            "environments/${ENVIRONMENT}.yaml"
 
           if git diff --cached --quiet; then
             echo "ERROR: No rollback changes were staged."
@@ -525,7 +586,7 @@ jobs:
           fi
 
           git commit \
-            -m "rollback(staging): revert to release ${ROLLBACK_TARGET}" \
+            -m "rollback(${ENVIRONMENT}): revert to release ${ROLLBACK_TARGET}" \
             -m "Reverted from: ${PREVIOUS_CURRENT_RELEASE}"
 
       - name: Push Rollback (with retry)
@@ -539,13 +600,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          # This is the fix for the push-race we identified: concurrency.group
-          # only serializes runs of THIS workflow against itself. A promotion
-          # or another rollback in a different workflow can still push to the
-          # same gitops main in between our pull and our push. A bare push
-          # here would die permanently on the first collision with no retry.
-          # This loop re-pulls and re-applies our already-committed change
-          # on top of whatever main has become, then retries the push.
+          # concurrency.group already prevents this from racing THIS SAME
+          # workflow's promotion for the same environment. This loop is the
+          # remaining defense against any OTHER workflow (a different
+          # environment's run, a manual hotfix commit) pushing to the same
+          # shared main in between our pull and our push.
 
           MAX_ATTEMPTS=5
           ATTEMPT=1
@@ -605,10 +664,11 @@ jobs:
 
         run: |
           {
-            echo "# Staging Rollback Applied"
+            echo "# ${ENVIRONMENT} Rollback Applied"
             echo ""
             echo "| Attribute | Value |"
             echo "|---|---|"
+            echo "| Environment | \`${ENVIRONMENT}\` |"
             echo "| Reverted From | \`${PREVIOUS_CURRENT_RELEASE}\` |"
             echo "| Reverted To | \`${ROLLBACK_TARGET}\` |"
             echo "| GitOps Commit | \`${GITOPS_COMMIT}\` |"
@@ -627,17 +687,16 @@ jobs:
 
     timeout-minutes: 5
 
-    # Deliberately no `environment: staging` gate here -- the deployment
-    # already happened in apply-rollback. This job is bookkeeping, not
-    # an action. It is also allowed to fail without failing the workflow
-    # (continue-on-error below): a registry write race here should never
-    # be interpreted as "the rollback didn't happen." If it fails, fix
-    # the registry by hand or on the next promotion -- do not re-run
-    # this whole workflow to retry it.
+    # Deliberately no `environment:` gate here -- the deployment already
+    # happened in apply-rollback. This job is bookkeeping, not an action,
+    # and is allowed to fail without failing the workflow: a registry
+    # write race here must never be interpreted as "the rollback didn't
+    # happen."
 
     continue-on-error: true
 
     env:
+      ENVIRONMENT: ${{ inputs.environment }}
       ROLLBACK_TARGET: ${{ needs.resolve-rollback-target.outputs.rollback-target }}
       PREVIOUS_CURRENT_RELEASE: ${{ needs.resolve-rollback-target.outputs.current-release }}
 
@@ -686,14 +745,18 @@ jobs:
 
           export ROLLED_BACK_AT
           export ROLLBACK_TARGET
+          export ENVIRONMENT
+
+          # Dynamic key access via strenv(ENVIRONMENT) -- avoids building
+          # yq expression strings by hand for "staging" vs "production".
 
           yq -i '
-            .promotion.staging.status = "rolled-back" |
-            .promotion.staging.rolledBackAt = strenv(ROLLED_BACK_AT) |
-            .promotion.staging.rolledBackTo = strenv(ROLLBACK_TARGET)
+            .promotion[strenv(ENVIRONMENT)].status = "rolled-back" |
+            .promotion[strenv(ENVIRONMENT)].rolledBackAt = strenv(ROLLED_BACK_AT) |
+            .promotion[strenv(ENVIRONMENT)].rolledBackTo = strenv(ROLLBACK_TARGET)
           ' "${RELEASE_FILE}"
 
-          echo "Annotated ${PREVIOUS_CURRENT_RELEASE} as rolled-back."
+          echo "Annotated ${PREVIOUS_CURRENT_RELEASE} as rolled-back for ${ENVIRONMENT}."
 
       - name: Configure Git Identity
 
@@ -723,7 +786,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "release: mark ${PREVIOUS_CURRENT_RELEASE} rolled-back to ${ROLLBACK_TARGET}"
+          git commit -m "release: mark ${PREVIOUS_CURRENT_RELEASE} rolled-back (${ENVIRONMENT}) to ${ROLLBACK_TARGET}"
 
           MAX_ATTEMPTS=3
           ATTEMPT=1
